@@ -1074,3 +1074,94 @@ def _get_nil_tier(value: float) -> str:
         return "moderate"
     else:
         return "entry"
+
+
+# =============================================================================
+# AI Search Endpoints
+# =============================================================================
+
+@router.post(
+    "/search",
+    response_model=APIResponse,
+    tags=["AI Search"],
+    summary="AI-powered natural language search",
+    description="Search the player database using natural language queries powered by Claude.",
+)
+async def ai_search(
+    request: Request,
+    body: dict,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Search the player database using natural language.
+
+    Example queries:
+    - "Show me 4-star QBs in the portal"
+    - "Top NIL prospects from SEC schools"
+    - "Undervalued players outperforming their recruiting ranking"
+    - "Portal WRs with 1000+ receiving yards"
+    """
+    from .ai_search import get_ai_search
+
+    query = body.get("query", "")
+    max_results = body.get("max_results", 25)
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+
+    ai = get_ai_search()
+
+    if not ai.is_available():
+        return APIResponse(
+            status="error",
+            message="AI search not available - ANTHROPIC_API_KEY not configured",
+            data={"results": []}
+        )
+
+    result = await ai.search(query, max_results)
+
+    if "error" in result:
+        return APIResponse(
+            status="error",
+            message=result["error"],
+            data=result
+        )
+
+    return APIResponse(
+        status="success",
+        data=result,
+        message=f"Found {result.get('count', 0)} results"
+    )
+
+
+@router.get(
+    "/search/status",
+    response_model=APIResponse,
+    tags=["AI Search"],
+    summary="Check AI search availability",
+)
+async def ai_search_status(
+    request: Request,
+    api_key: str = Depends(require_api_key),
+):
+    """Check if AI search is available and what data is loaded."""
+    from .ai_search import get_ai_search
+
+    ai = get_ai_search()
+
+    datasets = {}
+    for name, df in ai.data.items():
+        datasets[name] = {
+            "records": len(df),
+            "columns": list(df.columns)[:10]
+        }
+
+    return APIResponse(
+        status="success",
+        data={
+            "available": ai.is_available(),
+            "anthropic_configured": ai.client is not None,
+            "datasets_loaded": len(ai.data),
+            "datasets": datasets
+        }
+    )
