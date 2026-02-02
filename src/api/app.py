@@ -443,6 +443,65 @@ app.include_router(router, prefix="/api")
 
 
 # =============================================================================
+# WebSocket Routes
+# =============================================================================
+
+from fastapi import WebSocket, WebSocketDisconnect
+from .websocket import manager, Channels
+
+@app.websocket("/ws/{channel}")
+async def websocket_endpoint(websocket: WebSocket, channel: str):
+    """
+    WebSocket endpoint for real-time updates.
+
+    Channels:
+    - nil: NIL valuation updates
+    - portal: Transfer portal updates
+    - draft: Draft projection updates
+    - roster: Roster changes
+    - all: All updates
+    """
+    # Validate channel
+    valid_channels = [Channels.NIL, Channels.PORTAL, Channels.DRAFT, Channels.ROSTER, Channels.ALL]
+    if channel not in valid_channels:
+        await websocket.close(code=4000)
+        return
+
+    await manager.connect(websocket, channel)
+    try:
+        # Send welcome message
+        await manager.send_to_client(websocket, {
+            "type": "connected",
+            "channel": channel,
+            "message": f"Connected to {channel} channel"
+        })
+
+        # Keep connection alive and handle incoming messages
+        while True:
+            data = await websocket.receive_json()
+            # Handle ping/pong for keepalive
+            if data.get("type") == "ping":
+                await manager.send_to_client(websocket, {"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, channel)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        manager.disconnect(websocket, channel)
+
+
+@app.get("/ws/status", tags=["WebSocket"])
+async def websocket_status():
+    """Get WebSocket connection statistics."""
+    return {
+        "total_connections": manager.get_total_connections(),
+        "channels": {
+            channel: manager.get_channel_count(channel)
+            for channel in [Channels.NIL, Channels.PORTAL, Channels.DRAFT, Channels.ROSTER, Channels.ALL]
+        }
+    }
+
+
+# =============================================================================
 # Custom OpenAPI Schema
 # =============================================================================
 
