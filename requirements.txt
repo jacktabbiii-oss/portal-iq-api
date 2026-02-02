@@ -1,0 +1,72 @@
+# ML Engine Requirements
+# Elite Sports Solutions - Portal IQ & Cap IQ
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Data Processing
+pandas>=2.1.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# Sports Data APIs
+cfbd>=4.5.0
+nfl-data-py>=0.3.0
+
+# ML/Statistical
+scikit-learn>=1.3.0
+scipy>=1.11.0
+statsmodels>=0.14.0
+
+# Text Matching
+rapidfuzz>=3.5.0
+python-Levenshtein>=0.23.0
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# HTTP Client
+httpx>=0.26.0
+requests>=2.31.0
+
+# JWT/Auth
+PyJWT>=2.8.0
+python-jose[cryptography]>=3.3.0
+
+# Visualization (optional)
+plotly>=5.18.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Dashboard (optional)
+streamlit>=1.30.0
+
+# Database (optional)
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+
+# Caching
+diskcache>=5.6.0
+
+# Logging
+loguru>=0.7.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+httpx>=0.26.0
+
+# Development
+black>=23.12.0
+ruff>=0.1.0
+mypy>=1.8.0
+pre-commit>=3.6.0
+
+# Type stubs
+pandas-stubs>=2.1.0
+types-requests>=2.31.0
+types-PyYAML>=6.0.0

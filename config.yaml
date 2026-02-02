@@ -1,0 +1,616 @@
+# Portal IQ Configuration
+# Elite Sports Solutions - AI-Powered College Football Intelligence
+# =================================================================
+# All configurable parameters for the Portal IQ platform.
+# Do not commit sensitive values - use environment variables for secrets.
+
+# =============================================================================
+# General Settings
+# =============================================================================
+app_name: "Portal IQ"
+version: "1.0.0"
+environment: "development"  # development, staging, production
+debug: true
+
+# =============================================================================
+# API Configuration
+# =============================================================================
+api:
+  title: "Portal IQ API"
+  description: "AI-Powered College Football Intelligence Platform"
+  host: "0.0.0.0"
+  port: 8000
+  reload: true
+  workers: 4
+
+  # CORS settings
+  cors:
+    allow_origins:
+      - "http://localhost:3000"
+      - "http://localhost:8501"
+      - "https://app.portaliq.app"
+    allow_credentials: true
+    allow_methods: ["*"]
+    allow_headers: ["*"]
+
+  # Rate limiting
+  rate_limit:
+    requests_per_minute: 60
+    requests_per_day: 10000
+
+  # Request/response settings
+  max_request_size_mb: 10
+  response_timeout_seconds: 30
+
+# =============================================================================
+# Authentication
+# =============================================================================
+auth:
+  enabled: true
+  jwt_algorithm: "HS256"
+  token_expire_minutes: 60
+  api_key_header: "X-API-Key"
+
+# Subscription Tiers
+subscription_tiers:
+  free:
+    daily_requests: 100
+    features:
+      - "basic_search"
+      - "player_lookup"
+  pro:
+    daily_requests: 1000
+    features:
+      - "basic_search"
+      - "player_lookup"
+      - "nil_valuation"
+      - "portal_tracking"
+      - "draft_projection"
+  enterprise:
+    daily_requests: 10000
+    features:
+      - "all"
+
+# =============================================================================
+# Dashboard Configuration
+# =============================================================================
+dashboard:
+  title: "Portal IQ"
+  page_icon: "🏈"
+  layout: "wide"
+
+  # Theme colors
+  theme:
+    primary_color: "#00C853"
+    background_color: "#1a1a2e"
+    secondary_background: "#16213e"
+    text_color: "#ffffff"
+    card_background: "#0f3460"
+
+  # Feature flags
+  features:
+    show_demo_data: true
+    enable_exports: true
+    enable_api_integration: true
+
+# =============================================================================
+# Data Collection Configuration
+# =============================================================================
+data:
+  data_dir: "data"
+  cache_hours: 24
+  rate_limit_seconds: 0.5
+
+  # API endpoints
+  endpoints:
+    cfb_api: "https://api.collegefootballdata.com"
+    sports_reference: "https://www.sports-reference.com"
+
+  # Rate limiting for external APIs
+  rate_limits:
+    requests_per_second: 2
+    retry_attempts: 3
+    retry_delay_seconds: 5
+
+  # Cache settings
+  cache:
+    enabled: true
+    ttl_hours: 24
+    max_size_mb: 500
+
+  # Seasons to collect
+  seasons:
+    start_year: 2019
+    end_year: 2025
+
+# =============================================================================
+# School Configuration
+# =============================================================================
+school_tiers:
+  blue_blood:
+    tier: 5
+    schools:
+      - "Alabama"
+      - "Ohio State"
+      - "Georgia"
+      - "Clemson"
+      - "Oklahoma"
+      - "Notre Dame"
+      - "Texas"
+      - "USC"
+      - "Michigan"
+  elite:
+    tier: 4
+    schools:
+      - "Penn State"
+      - "LSU"
+      - "Florida"
+      - "Oregon"
+      - "Tennessee"
+      - "Miami"
+      - "Texas A&M"
+      - "Auburn"
+  power_brand:
+    tier: 3
+    schools:
+      - "Florida State"
+      - "Wisconsin"
+      - "UCLA"
+      - "Nebraska"
+      - "Arkansas"
+      - "South Carolina"
+      - "Ole Miss"
+      - "Washington"
+      - "Iowa"
+  p4_mid:
+    tier: 2
+    schools:
+      - "Michigan State"
+      - "NC State"
+      - "Virginia Tech"
+      - "Louisville"
+      - "Pittsburgh"
+      - "West Virginia"
+      - "Arizona State"
+      - "Kansas State"
+      - "Baylor"
+  g5_strong:
+    tier: 1
+    schools:
+      - "Boise State"
+      - "Memphis"
+      - "UCF"
+      - "SMU"
+      - "Tulane"
+      - "Liberty"
+      - "James Madison"
+      - "Appalachian State"
+
+# Conference Tiers
+conference_tiers:
+  tier_1:
+    multiplier: 1.3
+    conferences:
+      - "SEC"
+      - "Big Ten"
+  tier_2:
+    multiplier: 1.1
+    conferences:
+      - "Big 12"
+      - "ACC"
+  tier_3:
+    multiplier: 0.9
+    conferences:
+      - "American"
+      - "Mountain West"
+  tier_4:
+    multiplier: 0.7
+    conferences:
+      - "Sun Belt"
+      - "MAC"
+      - "Conference USA"
+  tier_5:
+    multiplier: 0.5
+    conferences:
+      - "FCS"
+
+# =============================================================================
+# NIL Configuration
+# =============================================================================
+nil:
+  # Value Tiers (USD thresholds)
+  tiers:
+    mega:
+      min_value: 1000000
+      label: "Mega Deal"
+      description: "$1M+ annual NIL value"
+      color: "#FFD700"
+    premium:
+      min_value: 250000
+      label: "Premium"
+      description: "$250K-$1M annual NIL value"
+      color: "#00C853"
+    solid:
+      min_value: 50000
+      label: "Solid"
+      description: "$50K-$250K annual NIL value"
+      color: "#2196F3"
+    moderate:
+      min_value: 10000
+      label: "Moderate"
+      description: "$10K-$50K annual NIL value"
+      color: "#9E9E9E"
+    entry:
+      min_value: 0
+      label: "Entry Level"
+      description: "Under $10K annual NIL value"
+      color: "#757575"
+
+  # Value component weights
+  weights:
+    production: 0.35
+    potential: 0.25
+    brand: 0.20
+    school: 0.15
+    market: 0.05
+
+# =============================================================================
+# Position Configuration
+# =============================================================================
+positions:
+  # Market premiums by position (multiplier on base value)
+  market_premiums:
+    QB: 2.5
+    RB: 1.2
+    WR: 1.4
+    TE: 1.1
+    OT: 0.9
+    OG: 0.8
+    C: 0.8
+    EDGE: 1.3
+    DT: 1.0
+    ILB: 1.0
+    OLB: 1.0
+    LB: 1.0
+    CB: 1.2
+    S: 1.0
+    K: 0.6
+    P: 0.5
+    LS: 0.3
+
+  # NFL contract value multipliers
+  nfl_values:
+    QB: 1.00
+    EDGE: 0.85
+    WR: 0.80
+    CB: 0.75
+    OT: 0.75
+    DT: 0.65
+    S: 0.60
+    LB: 0.55
+    TE: 0.55
+    IOL: 0.50
+    RB: 0.45
+    K: 0.20
+    P: 0.15
+    LS: 0.10
+
+  # Position Groups
+  groups:
+    offense:
+      skill: ["QB", "RB", "WR", "TE"]
+      line: ["OT", "OG", "C", "IOL"]
+    defense:
+      front: ["EDGE", "DT", "DE", "DL"]
+      coverage: ["CB", "S", "FS", "SS"]
+      linebacker: ["LB", "ILB", "OLB"]
+    special_teams: ["K", "P", "LS"]
+
+  # Position mappings (normalize various naming conventions)
+  mappings:
+    quarterback: "QB"
+    running_back: "RB"
+    wide_receiver: "WR"
+    tight_end: "TE"
+    offensive_tackle: "OT"
+    offensive_guard: "OG"
+    center: "C"
+    defensive_end: "EDGE"
+    defensive_tackle: "DT"
+    inside_linebacker: "ILB"
+    outside_linebacker: "OLB"
+    linebacker: "LB"
+    cornerback: "CB"
+    safety: "S"
+    kicker: "K"
+    punter: "P"
+    long_snapper: "LS"
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+models:
+  # NIL Valuator
+  nil_valuator:
+    ensemble_models:
+      - "ridge"
+      - "random_forest"
+      - "xgboost"
+      - "lightgbm"
+    meta_model: "ridge"
+
+    hyperparameters:
+      ridge:
+        alpha: 1.0
+      random_forest:
+        n_estimators: 100
+        max_depth: 10
+        min_samples_split: 5
+        random_state: 42
+      xgboost:
+        n_estimators: 100
+        max_depth: 6
+        learning_rate: 0.1
+        subsample: 0.8
+        colsample_bytree: 0.8
+        random_state: 42
+      lightgbm:
+        n_estimators: 100
+        num_leaves: 31
+        learning_rate: 0.1
+        feature_fraction: 0.8
+        random_state: 42
+
+    shap:
+      enabled: true
+      max_samples: 100
+      top_features: 10
+
+  # Portal Predictor
+  portal_predictor:
+    model_type: "xgboost"
+
+    hyperparameters:
+      xgboost:
+        n_estimators: 100
+        max_depth: 6
+        learning_rate: 0.1
+        scale_pos_weight: 5
+        random_state: 42
+
+    smote:
+      enabled: true
+      sampling_strategy: 0.5
+      k_neighbors: 5
+
+    risk_levels:
+      critical: 0.75
+      high: 0.50
+      moderate: 0.25
+      low: 0.0
+
+    calibration:
+      enabled: true
+      method: "sigmoid"
+
+  # Draft Projector
+  draft_projector:
+    classifier_model: "random_forest"
+    round_model: "xgboost"
+
+    hyperparameters:
+      random_forest:
+        n_estimators: 100
+        max_depth: 12
+        min_samples_split: 5
+        random_state: 42
+      xgboost:
+        n_estimators: 100
+        max_depth: 6
+        learning_rate: 0.1
+        random_state: 42
+
+    draft:
+      num_rounds: 7
+      picks_per_round: 32
+      draft_year: 2025
+
+    trade_value:
+      first_overall: 3000
+      end_of_first: 590
+      end_of_second: 270
+      end_of_third: 116
+
+  # Win Impact Model
+  win_model:
+    model_type: "ridge"
+
+    hyperparameters:
+      ridge:
+        alpha: 10.0
+
+    position_weights:
+      QB: 0.25
+      RB: 0.08
+      WR: 0.08
+      TE: 0.04
+      OL: 0.15
+      DL: 0.12
+      LB: 0.10
+      CB: 0.06
+      S: 0.04
+      K: 0.02
+      P: 0.02
+      LS: 0.01
+      coaching: 0.03
+
+  # Roster Optimizer
+  roster_optimizer:
+    solver: "CBC"
+    time_limit_seconds: 300
+    gap_tolerance: 0.01
+
+    constraints:
+      max_scholarship: 85
+      min_position_requirements:
+        QB: 2
+        RB: 3
+        WR: 5
+        TE: 2
+        OL: 8
+        DL: 6
+        LB: 5
+        CB: 4
+        S: 3
+        K: 1
+        P: 1
+
+# =============================================================================
+# Feature Engineering Configuration
+# =============================================================================
+features:
+  nil:
+    count: 57
+    categories:
+      performance:
+        - "games_played"
+        - "games_started"
+        - "pff_grade"
+        - "passing_yards"
+        - "passing_tds"
+        - "rushing_yards"
+        - "rushing_tds"
+        - "receiving_yards"
+        - "receiving_tds"
+        - "tackles"
+        - "sacks"
+        - "interceptions"
+      social_media:
+        - "instagram_followers"
+        - "twitter_followers"
+        - "tiktok_followers"
+        - "total_followers"
+        - "engagement_rate"
+      recruiting:
+        - "stars"
+        - "composite_rating"
+        - "national_rank"
+        - "position_rank"
+      school:
+        - "school_brand_tier"
+        - "conference_encoded"
+        - "nil_collective_strength"
+
+  portal:
+    count: 31
+    categories:
+      playing_time:
+        - "snap_count_pct"
+        - "starter_flag"
+        - "depth_chart_position"
+      satisfaction:
+        - "nil_value_vs_peers"
+        - "rating_vs_starters"
+        - "hometown_distance"
+      program:
+        - "recent_coaching_change"
+        - "team_win_trend"
+
+  draft:
+    count: 63
+    categories:
+      measurables:
+        - "height"
+        - "weight"
+        - "forty_yard"
+        - "vertical_jump"
+        - "broad_jump"
+      production:
+        - "games_played"
+        - "career_starts"
+        - "pff_grade"
+
+# =============================================================================
+# NFL Settings (for Cap IQ integration)
+# =============================================================================
+nfl:
+  salary_cap_2025: 255000000
+  cap_growth_rate: 0.07
+  practice_squad_salary: 12500
+  minimum_salaries:
+    0: 795000   # Rookie
+    1: 915000
+    2: 990000
+    3: 1065000
+    4: 1185000
+    5: 1260000
+    6: 1335000
+    7: 1425000  # 7+ years
+
+# =============================================================================
+# File Paths
+# =============================================================================
+paths:
+  data:
+    raw: "data/raw"
+    processed: "data/processed"
+    cache: "data/cache"
+  models:
+    saved: "models/saved"
+    checkpoints: "models/checkpoints"
+  outputs:
+    predictions: "outputs/predictions"
+    reports: "outputs/reports"
+  logs: "logs"
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/portal_iq.log"
+
+  handlers:
+    console:
+      enabled: true
+      level: "INFO"
+    file:
+      enabled: true
+      level: "DEBUG"
+      max_bytes: 10485760  # 10MB
+      backup_count: 5
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  cv_folds: 5
+  stratified: true
+  test_size: 0.2
+  validation_size: 0.1
+  random_state: 42
+
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+  tuning:
+    method: "optuna"
+    n_trials: 100
+    timeout_seconds: 3600
+
+# =============================================================================
+# Metrics and Monitoring
+# =============================================================================
+metrics:
+  alert_thresholds:
+    nil_mape: 0.30
+    nil_tier_accuracy: 0.65
+    portal_auc: 0.70
+    draft_accuracy: 0.60
+
+  tracking:
+    enabled: true
+    prediction_log_path: "logs/predictions.jsonl"
