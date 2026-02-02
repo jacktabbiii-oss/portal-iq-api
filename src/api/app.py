@@ -44,11 +44,14 @@ IS_PRODUCTION = ENVIRONMENT == "production"
 
 # API Key configuration
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+_api_keys_env = os.getenv("PORTAL_IQ_API_KEYS", "dev-key-123,playmaker-api-key")
+logger.info(f"Loading API keys from env (length={len(_api_keys_env)}): {_api_keys_env[:30]}...")
 VALID_API_KEYS = set(
     key.strip()
-    for key in os.getenv("PORTAL_IQ_API_KEYS", "dev-key-123,playmaker-api-key").split(",")
+    for key in _api_keys_env.split(",")
     if key.strip()
 )
+logger.info(f"Loaded {len(VALID_API_KEYS)} valid API keys: {[k[:8] + '...' for k in VALID_API_KEYS]}")
 
 # =============================================================================
 # Model Storage
