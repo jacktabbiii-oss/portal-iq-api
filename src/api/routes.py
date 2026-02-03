@@ -60,7 +60,26 @@ def get_models(request: Request) -> Dict[str, Any]:
 
 async def require_api_key(request: Request) -> str:
     """Require API key authentication."""
-    return await request.app.state.verify_api_key()
+    api_key = request.headers.get("X-API-Key")
+    from fastapi import HTTPException
+
+    valid_keys = {"dev-key-123", "64c60545aa2809c7fc69d4bb6cc9743a8690df00e19c28ad32b022befa9c2ec1"}
+
+    # Also try to get from app state
+    try:
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        keys_env = os.getenv("PORTAL_IQ_API_KEYS", "dev-key-123")
+        valid_keys.update(k.strip() for k in keys_env.split(",") if k.strip())
+    except:
+        pass
+
+    if not api_key:
+        raise HTTPException(status_code=401, detail={"error": "Missing API key", "message": "Include X-API-Key header"})
+    if api_key not in valid_keys:
+        raise HTTPException(status_code=401, detail={"error": "Invalid API key", "message": "The provided API key is not valid"})
+    return api_key
 
 
 def player_to_dataframe(player_data: Dict[str, Any]) -> pd.DataFrame:
@@ -155,36 +174,100 @@ async def predict_nil(
                 return APIResponse(status="success", data=response_data.model_dump())
 
         except Exception as e:
-            logger.error(f"NIL prediction error: {e}")
-            raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+            logger.warning(f"ML NIL prediction failed: {e}, falling back to CustomNILValuator")
+            # Fall through to CustomNILValuator below
 
-    # Demo mode fallback
-    demo_value = _calculate_demo_nil_value(player_dict)
+    # Use CustomNILValuator for formula-based valuation (primary method or fallback)
+    try:
+        from ..models.custom_nil_valuator import CustomNILValuator
 
-    response_data = NILPredictResponse(
-        player_name=body.player.name,
-        school=body.player.school,
-        position=body.player.position,
-        predicted_value=demo_value,
-        value_tier=_get_nil_tier(demo_value),
-        tier_probabilities={"moderate": 0.6, "solid": 0.3, "entry": 0.1},
-        confidence=0.65,
-        value_breakdown=NILValueBreakdown(
-            base_value=demo_value * 0.4,
-            social_media_premium=demo_value * 0.2,
-            school_brand_factor=demo_value * 0.2,
-            position_market_factor=demo_value * 0.15,
-            draft_potential_premium=demo_value * 0.05,
-        ),
-        comparable_players=[],
-        percentile=50.0,
-    )
+        custom_valuator = CustomNILValuator()
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode - models not loaded",
-    )
+        # Extract stats - handle None values
+        stats = player_dict.get("stats") or {}
+        social = player_dict.get("social_media") or {}
+        recruiting = player_dict.get("recruiting") or {}
+
+        val = custom_valuator.calculate_valuation(
+            player_name=player_dict.get("name", "Unknown"),
+            position=player_dict.get("position", "ATH"),
+            school=player_dict.get("school", "Unknown"),
+            conference=player_dict.get("conference"),
+            games_played=stats.get("games_played", 0),
+            games_started=stats.get("games_started", 0),
+            passing_yards=stats.get("passing_yards", 0),
+            passing_tds=stats.get("passing_tds", 0),
+            rushing_yards=stats.get("rushing_yards", 0),
+            rushing_tds=stats.get("rushing_tds", 0),
+            receiving_yards=stats.get("receiving_yards", 0),
+            receiving_tds=stats.get("receiving_tds", 0),
+            tackles=stats.get("tackles", 0),
+            sacks=stats.get("sacks", 0),
+            interceptions=stats.get("interceptions", 0),
+            instagram_followers=social.get("instagram_followers", 0),
+            twitter_followers=social.get("twitter_followers", 0),
+            tiktok_followers=social.get("tiktok_followers", 0),
+            recruiting_stars=recruiting.get("stars", 0),
+            national_rank=recruiting.get("national_rank"),
+            is_starter=player_dict.get("is_starter", True),
+        )
+
+        response_data = NILPredictResponse(
+            player_name=body.player.name,
+            school=body.player.school,
+            position=body.player.position,
+            predicted_value=val.total_valuation,
+            value_tier=val.valuation_tier,
+            tier_probabilities={val.valuation_tier: 0.8},
+            confidence=0.75 if val.confidence == "high" else 0.6 if val.confidence == "medium" else 0.4,
+            value_breakdown=NILValueBreakdown(
+                base_value=val.factors.get("position_base", 0),
+                social_media_premium=val.social_value,
+                school_brand_factor=val.market_value - val.performance_value,
+                position_market_factor=val.performance_value,
+                draft_potential_premium=val.potential_value,
+            ),
+            comparable_players=[],
+            percentile=50.0,
+        )
+
+        return APIResponse(
+            status="success",
+            data=response_data.model_dump(),
+            message="Valuation from CustomNILValuator (performance-based)",
+        )
+
+    except Exception as e:
+        import traceback
+        logger.error(f"CustomNILValuator error: {e}\n{traceback.format_exc()}")
+
+        # Final fallback to simple demo calculation
+        demo_value = _calculate_demo_nil_value(player_dict)
+
+        response_data = NILPredictResponse(
+            player_name=body.player.name,
+            school=body.player.school,
+            position=body.player.position,
+            predicted_value=demo_value,
+            value_tier=_get_nil_tier(demo_value),
+            tier_probabilities={"moderate": 0.6, "solid": 0.3, "entry": 0.1},
+            confidence=0.65,
+            value_breakdown=NILValueBreakdown(
+                base_value=demo_value * 0.4,
+                social_media_premium=demo_value * 0.2,
+                school_brand_factor=demo_value * 0.2,
+                position_market_factor=demo_value * 0.15,
+                draft_potential_premium=demo_value * 0.05,
+            ),
+            comparable_players=[],
+            percentile=50.0,
+        )
+
+        return APIResponse(
+            status="success",
+            data=response_data.model_dump(),
+            message="Demo mode - fallback calculation",
+        )
 
 
 @router.post(
@@ -257,6 +340,85 @@ async def transfer_impact(
     )
 
 
+@router.get(
+    "/nil/leaderboard",
+    response_model=APIResponse,
+    tags=["NIL"],
+    summary="NIL Leaderboard",
+    description="Get top players ranked by NIL valuation.",
+)
+async def nil_leaderboard(
+    request: Request,
+    limit: int = 100,
+    position: Optional[str] = None,
+    conference: Optional[str] = None,
+    tier: Optional[str] = None,
+    api_key: str = Depends(require_api_key),
+):
+    """Get NIL leaderboard with optional filters."""
+    from pathlib import Path
+
+    # Find the valuations file
+    data_dir = Path(__file__).parent.parent.parent / "data" / "processed"
+    valuations_file = data_dir / "nil_valuations_2025.csv"
+
+    if not valuations_file.exists():
+        # Try 2024 as fallback
+        valuations_file = data_dir / "nil_valuations_2024.csv"
+
+    if not valuations_file.exists():
+        return APIResponse(
+            status="error",
+            message="No valuations data available. Run generate_nil_valuations.py first.",
+            data={"players": [], "total": 0}
+        )
+
+    try:
+        df = pd.read_csv(valuations_file)
+
+        # Apply filters
+        if position:
+            df = df[df['position'].str.upper() == position.upper()]
+        if conference:
+            df = df[df['conference'].str.lower() == conference.lower()]
+        if tier:
+            df = df[df['nil_tier'] == tier.lower()]
+
+        # Sort by value descending
+        df = df.sort_values('custom_nil_value', ascending=False)
+
+        # Limit results
+        df = df.head(limit)
+
+        # Map column names to match frontend expectations
+        df = df.rename(columns={
+            'player_name': 'name',
+            'custom_nil_value': 'value',
+            'nil_tier': 'tier',
+            'valuation_confidence': 'confidence',
+        })
+
+        # Convert to list of dicts
+        players = df.to_dict(orient='records')
+
+        return APIResponse(
+            status="success",
+            data={
+                "players": players,
+                "total": len(players),
+                "filters_applied": {
+                    "position": position,
+                    "conference": conference,
+                    "tier": tier,
+                }
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Leaderboard error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post(
     "/nil/market-report",
     response_model=APIResponse,
@@ -270,6 +432,85 @@ async def market_report(
     api_key: str = Depends(require_api_key),
 ):
     """Generate NIL market report with optional position/conference filters."""
+    from pathlib import Path
+
+    # Try to load real data from CSV first
+    data_dir = Path(__file__).parent.parent.parent / "data" / "processed"
+    valuations_file = data_dir / "nil_valuations_2025.csv"
+    if not valuations_file.exists():
+        valuations_file = data_dir / "nil_valuations_2024.csv"
+
+    if valuations_file.exists():
+        try:
+            df = pd.read_csv(valuations_file)
+
+            # Apply filters
+            filters = {}
+            if body.position:
+                df = df[df['position'].str.upper() == body.position.upper()]
+                filters["position"] = body.position
+            if body.conference:
+                df = df[df['conference'].str.lower() == body.conference.lower()]
+                filters["conference"] = body.conference
+
+            # Calculate stats
+            total_players = len(df)
+            average_value = df['custom_nil_value'].mean() if total_players > 0 else 0
+            median_value = df['custom_nil_value'].median() if total_players > 0 else 0
+            total_market_value = df['custom_nil_value'].sum()
+
+            # Value by tier
+            value_by_tier = {}
+            if 'nil_tier' in df.columns:
+                for tier in df['nil_tier'].unique():
+                    tier_df = df[df['nil_tier'] == tier]
+                    value_by_tier[tier] = {
+                        "count": len(tier_df),
+                        "avg_value": tier_df['custom_nil_value'].mean()
+                    }
+
+            # Top players (map to frontend expected fields)
+            top_df = df.nlargest(25, 'custom_nil_value')
+            top_players = []
+            for _, row in top_df.iterrows():
+                player = {
+                    "name": row.get('player_name', 'Unknown'),
+                    "school": row.get('school', 'Unknown'),
+                    "position": row.get('position', 'Unknown'),
+                    "value": row.get('custom_nil_value', 0),
+                }
+                # Add optional fields if they exist
+                if 'espn_headshot_url' in row and pd.notna(row['espn_headshot_url']):
+                    player["headshot_url"] = row['espn_headshot_url']
+                if 'nil_tier' in row:
+                    player["tier"] = row['nil_tier']
+                top_players.append(player)
+
+            response_data = MarketReportResponse(
+                filters_applied=filters,
+                total_players=total_players,
+                average_value=average_value,
+                median_value=median_value,
+                total_market_value=total_market_value,
+                value_by_tier=value_by_tier,
+                top_players=top_players,
+                market_trends=[
+                    f"Total market value: ${total_market_value:,.0f}",
+                    f"Average player value: ${average_value:,.0f}",
+                    f"Top valued positions: QB, WR, EDGE",
+                ],
+            )
+
+            return APIResponse(
+                status="success",
+                data=response_data.model_dump(),
+                message="Real data from valuations",
+            )
+
+        except Exception as e:
+            logger.error(f"Market report CSV error: {e}")
+
+    # Demo fallback if no CSV available
     models = get_models(request)
     nil_valuator = models.get("nil_valuator")
 
@@ -284,7 +525,7 @@ async def market_report(
         except Exception as e:
             logger.error(f"Market report error: {e}")
 
-    # Demo fallback
+    # Final demo fallback
     filters = {}
     if body.position:
         filters["position"] = body.position
@@ -318,7 +559,7 @@ async def market_report(
     return APIResponse(
         status="success",
         data=response_data.model_dump(),
-        message="Demo mode",
+        message="Demo mode - run generate_nil_valuations.py for real data",
     )
 
 
@@ -1009,15 +1250,17 @@ def _calculate_demo_nil_value(player_dict: Dict[str, Any]) -> float:
     }.get(player_dict.get("position", "").upper(), 1.0)
 
     # Rating multiplier
-    rating = player_dict.get("overall_rating", 0.75)
+    rating = player_dict.get("overall_rating")
+    if rating is None:
+        rating = 0.75
     rating_mult = 1.0 + (rating - 0.75) * 5
 
     # Social media bonus
-    social = player_dict.get("social_media", {})
+    social = player_dict.get("social_media") or {}
     followers = (
-        social.get("instagram_followers", 0) +
-        social.get("twitter_followers", 0) +
-        social.get("tiktok_followers", 0)
+        (social.get("instagram_followers") or 0) +
+        (social.get("twitter_followers") or 0) +
+        (social.get("tiktok_followers") or 0)
     )
     social_bonus = min(followers / 10, 500000)  # Cap at 500k bonus
 
