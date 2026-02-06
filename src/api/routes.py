@@ -9,7 +9,15 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+# Import data loader for real S3/R2 data
+from ..utils.data_loader import (
+    get_nil_players,
+    get_portal_players,
+    get_database_stats,
+    _get_nil_tier,
+)
 
 from .schemas import (
     # Base
@@ -345,61 +353,52 @@ async def transfer_impact(
     response_model=APIResponse,
     tags=["NIL"],
     summary="NIL Leaderboard",
-    description="Get top players ranked by NIL valuation.",
+    description="Get top players ranked by NIL valuation from real data.",
 )
 async def nil_leaderboard(
     request: Request,
-    limit: int = 100,
-    position: Optional[str] = None,
-    conference: Optional[str] = None,
-    tier: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    position: Optional[str] = Query(None, description="Filter by position (QB, WR, etc.)"),
+    school: Optional[str] = Query(None, description="Filter by school name"),
+    conference: Optional[str] = Query(None, description="Filter by conference"),
     api_key: str = Depends(require_api_key),
 ):
-    """Get NIL leaderboard with optional filters."""
-    from pathlib import Path
-
-    # Find the valuations file
-    data_dir = Path(__file__).parent.parent.parent / "data" / "processed"
-    valuations_file = data_dir / "nil_valuations_2025.csv"
-
-    if not valuations_file.exists():
-        # Try 2024 as fallback
-        valuations_file = data_dir / "nil_valuations_2024.csv"
-
-    if not valuations_file.exists():
-        return APIResponse(
-            status="error",
-            message="No valuations data available. Run generate_nil_valuations.py first.",
-            data={"players": [], "total": 0}
+    """Get NIL leaderboard with real data from Cloudflare R2."""
+    try:
+        # Use data_loader which pulls from S3/R2 with local fallback
+        df = get_nil_players(
+            position=position,
+            school=school,
+            conference=conference,
+            limit=limit,
         )
 
-    try:
-        df = pd.read_csv(valuations_file)
+        if df.empty:
+            return APIResponse(
+                status="success",
+                data={"players": [], "total": 0},
+                message="No players found matching criteria"
+            )
 
-        # Apply filters
-        if position:
-            df = df[df['position'].str.upper() == position.upper()]
-        if conference:
-            df = df[df['conference'].str.lower() == conference.lower()]
-        if tier:
-            df = df[df['nil_tier'] == tier.lower()]
+        # Build response list
+        players = []
+        for rank, (_, row) in enumerate(df.iterrows(), start=1):
+            nil_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
+            player_name = str(row.get("name", "Unknown"))
 
-        # Sort by value descending
-        df = df.sort_values('custom_nil_value', ascending=False)
-
-        # Limit results
-        df = df.head(limit)
-
-        # Map column names to match frontend expectations
-        df = df.rename(columns={
-            'player_name': 'name',
-            'custom_nil_value': 'value',
-            'nil_tier': 'tier',
-            'valuation_confidence': 'confidence',
-        })
-
-        # Convert to list of dicts
-        players = df.to_dict(orient='records')
+            player_data = {
+                "rank": rank,
+                "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
+                "name": player_name,
+                "position": str(row.get("position", "")),
+                "school": str(row.get("school", "")),
+                "conference": str(row.get("conference", "")) if pd.notna(row.get("conference")) else None,
+                "value": nil_value,
+                "tier": str(row.get("tier", _get_nil_tier(nil_value))),
+                "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                "valuation_source": str(row.get("valuation_source", "On3")) if pd.notna(row.get("valuation_source")) else "On3",
+            }
+            players.append(player_data)
 
         return APIResponse(
             status="success",
@@ -408,15 +407,17 @@ async def nil_leaderboard(
                 "total": len(players),
                 "filters_applied": {
                     "position": position,
+                    "school": school,
                     "conference": conference,
-                    "tier": tier,
                 }
             }
         )
 
     except Exception as e:
-        logger.error(f"Leaderboard error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"NIL leaderboard error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to load NIL data: {str(e)}")
 
 
 @router.post(
@@ -566,6 +567,97 @@ async def market_report(
 # =============================================================================
 # Portal Endpoints
 # =============================================================================
+
+@router.get(
+    "/portal/active",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Active portal players",
+    description="Get current transfer portal players with real data from On3.",
+)
+async def portal_active(
+    request: Request,
+    position: Optional[str] = Query(None, description="Filter by position"),
+    origin_school: Optional[str] = Query(None, description="Filter by origin school"),
+    origin_conference: Optional[str] = Query(None, description="Filter by origin conference"),
+    min_stars: Optional[int] = Query(None, ge=1, le=5, description="Minimum star rating"),
+    status: Optional[str] = Query("all", regex="^(available|committed|all)$"),
+    limit: int = Query(200, ge=1, le=500),
+    api_key: str = Depends(require_api_key),
+):
+    """Get active transfer portal players with real data from Cloudflare R2."""
+    try:
+        # Map status to filter
+        status_filter = None
+        if status == "available":
+            status_filter = "Entered"
+        elif status == "committed":
+            status_filter = "Committed"
+
+        # Use data_loader which pulls from S3/R2
+        df = get_portal_players(
+            status=status_filter,
+            position=position,
+            origin_school=origin_school,
+            origin_conference=origin_conference,
+            min_stars=min_stars,
+            limit=limit,
+        )
+
+        if df.empty:
+            return APIResponse(
+                status="success",
+                data={"players": [], "total": 0},
+                message="No portal players found matching criteria"
+            )
+
+        # Build response list
+        players = []
+        for _, row in df.iterrows():
+            player_name = str(row.get("name", "Unknown"))
+            raw_status = str(row.get("status", "Entered")).lower()
+
+            # Map status string
+            if raw_status == "committed":
+                player_status = "committed"
+            elif raw_status == "withdrawn":
+                player_status = "withdrawn"
+            else:
+                player_status = "available"
+
+            player_data = {
+                "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
+                "player_name": player_name,
+                "position": str(row.get("position", "")),
+                "origin_school": str(row.get("origin_school", "")),
+                "origin_conference": str(row.get("conference")) if pd.notna(row.get("conference")) else None,
+                "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
+                "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                "status": player_status,
+                "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+            }
+            players.append(player_data)
+
+        return APIResponse(
+            status="success",
+            data={
+                "players": players,
+                "total": len(players),
+                "filters_applied": {
+                    "position": position,
+                    "origin_school": origin_school,
+                    "status": status,
+                }
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Portal active error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to load portal data: {str(e)}")
+
 
 @router.post(
     "/portal/flight-risk",
