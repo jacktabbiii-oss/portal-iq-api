@@ -11,13 +11,14 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-# Import data loader for real S3/R2 data
+# Import data loader for real R2 data (no local fallback)
 from ..utils.data_loader import (
     get_nil_players,
     get_portal_players,
     get_database_stats,
     _get_nil_tier,
 )
+from ..utils.s3_storage import R2NotConfiguredError, R2DataLoadError
 
 from .schemas import (
     # Base
@@ -386,17 +387,25 @@ async def nil_leaderboard(
             nil_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
             player_name = str(row.get("name", "Unknown"))
 
+            # Use field names that match frontend expectations
             player_data = {
                 "rank": rank,
                 "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
-                "name": player_name,
+                "player_name": player_name,  # Frontend expects player_name
                 "position": str(row.get("position", "")),
                 "school": str(row.get("school", "")),
                 "conference": str(row.get("conference", "")) if pd.notna(row.get("conference")) else None,
-                "value": nil_value,
-                "tier": str(row.get("tier", _get_nil_tier(nil_value))),
+                "valuation": nil_value,  # Frontend expects valuation
+                "nil_tier": str(row.get("tier", _get_nil_tier(nil_value))),  # Frontend expects nil_tier
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
                 "valuation_source": str(row.get("valuation_source", "On3")) if pd.notna(row.get("valuation_source")) else "On3",
+                # Additional fields for detail view
+                "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
+                "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
+                "pff_overall": float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else None,
+                "pff_offense": float(row.get("pff_offense", 0)) if pd.notna(row.get("pff_offense")) else None,
+                "pff_defense": float(row.get("pff_defense", 0)) if pd.notna(row.get("pff_defense")) else None,
             }
             players.append(player_data)
 
@@ -413,6 +422,24 @@ async def nil_leaderboard(
             }
         )
 
+    except R2NotConfiguredError as e:
+        logger.error(f"R2 not configured: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Storage not configured",
+                "message": "R2 storage is required but not configured. Contact support.",
+            }
+        )
+    except R2DataLoadError as e:
+        logger.error(f"R2 data load failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Data unavailable",
+                "message": "Could not load NIL data from storage. Try again later.",
+            }
+        )
     except Exception as e:
         logger.error(f"NIL leaderboard error: {e}")
         import traceback
@@ -636,6 +663,10 @@ async def portal_active(
                 "status": player_status,
                 "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                # Additional fields for detail view
+                "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
+                "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
+                "pff_overall": float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else None,
             }
             players.append(player_data)
 
@@ -652,6 +683,24 @@ async def portal_active(
             }
         )
 
+    except R2NotConfiguredError as e:
+        logger.error(f"R2 not configured: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Storage not configured",
+                "message": "R2 storage is required but not configured. Contact support.",
+            }
+        )
+    except R2DataLoadError as e:
+        logger.error(f"R2 data load failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Data unavailable",
+                "message": "Could not load portal data from storage. Try again later.",
+            }
+        )
     except Exception as e:
         logger.error(f"Portal active error: {e}")
         import traceback
@@ -1500,3 +1549,273 @@ async def ai_search_status(
             "datasets": datasets
         }
     )
+
+
+# =============================================================================
+# Player Search Endpoints
+# =============================================================================
+
+@router.get(
+    "/players/search",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Search players",
+    description="Search for players by name across NIL and portal data.",
+)
+async def search_players(
+    request: Request,
+    query: str = Query(..., min_length=2, description="Search query"),
+    data_type: str = Query("all", regex="^(nil|portal|all)$", description="Data source to search"),
+    limit: int = Query(25, ge=1, le=100),
+    api_key: str = Depends(require_api_key),
+):
+    """Search players by name across NIL and portal data."""
+    try:
+        results = []
+        query_lower = query.lower()
+
+        # Search NIL data
+        if data_type in ("nil", "all"):
+            nil_df = get_nil_players(limit=500)
+            if not nil_df.empty:
+                # Filter by name match
+                mask = nil_df["name"].str.lower().str.contains(query_lower, na=False)
+                matching = nil_df[mask].head(limit if data_type == "nil" else limit // 2)
+
+                for _, row in matching.iterrows():
+                    results.append({
+                        "name": str(row.get("name", "Unknown")),
+                        "position": str(row.get("position", "")),
+                        "school": str(row.get("school", "")),
+                        "nil_value": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                        "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                        "pff_overall": float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else None,
+                        "status": None,
+                        "destination_school": None,
+                        "data_source": "nil",
+                    })
+
+        # Search Portal data
+        if data_type in ("portal", "all"):
+            portal_df = get_portal_players(limit=500)
+            if not portal_df.empty:
+                mask = portal_df["name"].str.lower().str.contains(query_lower, na=False)
+                matching = portal_df[mask].head(limit if data_type == "portal" else limit // 2)
+
+                for _, row in matching.iterrows():
+                    # Check if already in results (from NIL)
+                    player_name = str(row.get("name", "Unknown"))
+                    if any(r["name"] == player_name for r in results):
+                        continue
+
+                    raw_status = str(row.get("status", "Entered")).lower()
+                    if raw_status == "committed":
+                        player_status = "committed"
+                    elif raw_status == "withdrawn":
+                        player_status = "withdrawn"
+                    else:
+                        player_status = "available"
+
+                    results.append({
+                        "name": player_name,
+                        "position": str(row.get("position", "")),
+                        "school": str(row.get("origin_school", "")),
+                        "nil_value": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                        "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                        "pff_overall": float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else None,
+                        "status": player_status,
+                        "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
+                        "data_source": "portal",
+                    })
+
+        # Sort by NIL value descending
+        results.sort(key=lambda x: x.get("nil_value") or 0, reverse=True)
+
+        return APIResponse(
+            status="success",
+            data={
+                "players": results[:limit],
+                "total": len(results),
+                "query": query,
+            }
+        )
+
+    except R2NotConfiguredError as e:
+        logger.error(f"R2 not configured: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Storage not configured",
+                "message": "R2 storage is required but not configured. Contact support.",
+            }
+        )
+    except R2DataLoadError as e:
+        logger.error(f"R2 data load failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Data unavailable",
+                "message": "Could not load player data from storage. Try again later.",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Player search error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@router.get(
+    "/players/{player_name}/stats",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Get player stats",
+    description="Get comprehensive stats for a specific player.",
+)
+async def get_player_stats(
+    request: Request,
+    player_name: str,
+    season: int = Query(2025, description="Season year"),
+    api_key: str = Depends(require_api_key),
+):
+    """Get detailed stats for a player by name."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+        player_name_lower = player_name.lower()
+
+        # Search in NIL data first
+        nil_df = get_nil_players(limit=500)
+        player_row = None
+
+        if not nil_df.empty:
+            mask = nil_df["name"].str.lower() == player_name_lower
+            matches = nil_df[mask]
+            if not matches.empty:
+                player_row = matches.iloc[0]
+
+        # If not found in NIL, check portal
+        if player_row is None:
+            portal_df = get_portal_players(limit=500)
+            if not portal_df.empty:
+                mask = portal_df["name"].str.lower() == player_name_lower
+                matches = portal_df[mask]
+                if not matches.empty:
+                    player_row = matches.iloc[0]
+
+        if player_row is None:
+            raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
+
+        # Build comprehensive stats response
+        stats = {
+            "name": str(player_row.get("name", player_name)),
+            "position": str(player_row.get("position", "")),
+            "school": str(player_row.get("school", player_row.get("origin_school", ""))),
+            "headshot_url": str(player_row.get("headshot_url")) if pd.notna(player_row.get("headshot_url")) else None,
+            "season": season,
+            "nil_value": float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else None,
+            "nil_tier": str(player_row.get("tier", _get_nil_tier(float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else 0))),
+            "stars": int(player_row.get("stars", 0)) if pd.notna(player_row.get("stars")) else None,
+            "height": float(player_row.get("height", 0)) if pd.notna(player_row.get("height")) else None,
+            "weight": float(player_row.get("weight", 0)) if pd.notna(player_row.get("weight")) else None,
+            "pff": {
+                "overall": float(player_row.get("pff_overall", 0)) if pd.notna(player_row.get("pff_overall")) else None,
+                "offense": float(player_row.get("pff_offense", 0)) if pd.notna(player_row.get("pff_offense")) else None,
+                "defense": float(player_row.get("pff_defense", 0)) if pd.notna(player_row.get("pff_defense")) else None,
+                "passing": float(player_row.get("pff_passing", 0)) if pd.notna(player_row.get("pff_passing")) else None,
+                "rushing": float(player_row.get("pff_rushing", 0)) if pd.notna(player_row.get("pff_rushing")) else None,
+                "receiving": float(player_row.get("pff_receiving", 0)) if pd.notna(player_row.get("pff_receiving")) else None,
+                "pass_block": float(player_row.get("pff_pass_block", 0)) if pd.notna(player_row.get("pff_pass_block")) else None,
+                "run_block": float(player_row.get("pff_run_block", 0)) if pd.notna(player_row.get("pff_run_block")) else None,
+                "pass_rush": float(player_row.get("pff_pass_rush", 0)) if pd.notna(player_row.get("pff_pass_rush")) else None,
+                "run_defense": float(player_row.get("pff_run_defense", 0)) if pd.notna(player_row.get("pff_run_defense")) else None,
+                "tackling": float(player_row.get("pff_tackling", 0)) if pd.notna(player_row.get("pff_tackling")) else None,
+                "coverage": float(player_row.get("pff_coverage", 0)) if pd.notna(player_row.get("pff_coverage")) else None,
+            },
+        }
+
+        # Add position-specific stats if available
+        position = str(player_row.get("position", "")).upper()
+
+        if position == "QB":
+            stats["passing"] = {
+                "passer_rating": float(player_row.get("passer_rating", 0)) if pd.notna(player_row.get("passer_rating")) else None,
+                "completion_pct": float(player_row.get("completion_pct", 0)) if pd.notna(player_row.get("completion_pct")) else None,
+                "big_time_throws": float(player_row.get("big_time_throws", 0)) if pd.notna(player_row.get("big_time_throws")) else None,
+                "big_time_throw_pct": float(player_row.get("big_time_throw_pct", 0)) if pd.notna(player_row.get("big_time_throw_pct")) else None,
+                "turnover_worthy_plays": float(player_row.get("turnover_worthy_plays", 0)) if pd.notna(player_row.get("turnover_worthy_plays")) else None,
+                "yards": float(player_row.get("passing_yards", 0)) if pd.notna(player_row.get("passing_yards")) else None,
+                "touchdowns": float(player_row.get("passing_tds", 0)) if pd.notna(player_row.get("passing_tds")) else None,
+            }
+
+        if position in ("RB", "QB"):
+            stats["rushing"] = {
+                "elusive_rating": float(player_row.get("elusive_rating", 0)) if pd.notna(player_row.get("elusive_rating")) else None,
+                "yards_after_contact": float(player_row.get("yards_after_contact", 0)) if pd.notna(player_row.get("yards_after_contact")) else None,
+                "breakaway_pct": float(player_row.get("breakaway_pct", 0)) if pd.notna(player_row.get("breakaway_pct")) else None,
+                "yards": float(player_row.get("rushing_yards", 0)) if pd.notna(player_row.get("rushing_yards")) else None,
+                "touchdowns": float(player_row.get("rushing_tds", 0)) if pd.notna(player_row.get("rushing_tds")) else None,
+                "yards_per_carry": float(player_row.get("yards_per_carry", 0)) if pd.notna(player_row.get("yards_per_carry")) else None,
+            }
+
+        if position in ("WR", "TE", "RB"):
+            stats["receiving"] = {
+                "yards_per_route_run": float(player_row.get("yards_per_route_run", 0)) if pd.notna(player_row.get("yards_per_route_run")) else None,
+                "drop_rate": float(player_row.get("drop_rate", 0)) if pd.notna(player_row.get("drop_rate")) else None,
+                "contested_catch_rate": float(player_row.get("contested_catch_rate", 0)) if pd.notna(player_row.get("contested_catch_rate")) else None,
+                "yards": float(player_row.get("receiving_yards", 0)) if pd.notna(player_row.get("receiving_yards")) else None,
+                "touchdowns": float(player_row.get("receiving_tds", 0)) if pd.notna(player_row.get("receiving_tds")) else None,
+            }
+
+        if position in ("EDGE", "DT", "DL", "DE"):
+            stats["pass_rush"] = {
+                "pass_rushing_productivity": float(player_row.get("pass_rushing_productivity", 0)) if pd.notna(player_row.get("pass_rushing_productivity")) else None,
+                "pass_rush_win_rate": float(player_row.get("pass_rush_win_rate", 0)) if pd.notna(player_row.get("pass_rush_win_rate")) else None,
+                "pressures": float(player_row.get("pressures", 0)) if pd.notna(player_row.get("pressures")) else None,
+                "sacks": float(player_row.get("sacks", 0)) if pd.notna(player_row.get("sacks")) else None,
+            }
+
+        if position in ("CB", "S", "LB"):
+            stats["coverage"] = {
+                "passer_rating_allowed": float(player_row.get("passer_rating_allowed", 0)) if pd.notna(player_row.get("passer_rating_allowed")) else None,
+                "yards_per_coverage_snap": float(player_row.get("yards_per_coverage_snap", 0)) if pd.notna(player_row.get("yards_per_coverage_snap")) else None,
+                "interceptions": float(player_row.get("interceptions", 0)) if pd.notna(player_row.get("interceptions")) else None,
+                "pass_breakups": float(player_row.get("pass_breakups", 0)) if pd.notna(player_row.get("pass_breakups")) else None,
+            }
+
+        if position in ("OT", "OG", "C", "OL"):
+            stats["blocking"] = {
+                "pass_blocking_efficiency": float(player_row.get("pass_blocking_efficiency", 0)) if pd.notna(player_row.get("pass_blocking_efficiency")) else None,
+                "pressures_allowed": float(player_row.get("pressures_allowed", 0)) if pd.notna(player_row.get("pressures_allowed")) else None,
+                "sacks_allowed": float(player_row.get("sacks_allowed", 0)) if pd.notna(player_row.get("sacks_allowed")) else None,
+            }
+
+        return APIResponse(status="success", data=stats)
+
+    except HTTPException:
+        raise
+    except R2NotConfiguredError as e:
+        logger.error(f"R2 not configured: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Storage not configured",
+                "message": "R2 storage is required but not configured. Contact support.",
+            }
+        )
+    except R2DataLoadError as e:
+        logger.error(f"R2 data load failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Data unavailable",
+                "message": "Could not load player stats from storage. Try again later.",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Player stats error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to get player stats: {str(e)}")

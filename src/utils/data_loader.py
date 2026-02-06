@@ -1,8 +1,8 @@
 """
 Data Loader Utilities
 
-Unified data loading for ML Engine with S3/R2 and local fallback support.
-Provides real data from Cloudflare R2 storage for production.
+Unified data loading for ML Engine using Cloudflare R2 storage.
+R2 is REQUIRED - no local fallback. All data must be in R2.
 """
 
 import logging
@@ -18,6 +18,8 @@ from .s3_storage import (
     load_data as s3_load_data,
     is_s3_configured,
     get_s3_client,
+    R2NotConfiguredError,
+    R2DataLoadError,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,25 +30,26 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def _load_csv(filename: str, subdir: str = "processed", cache_hours: int = 1, **kwargs) -> pd.DataFrame:
-    """Load CSV from S3 or local storage with fallback.
+    """Load CSV from R2 storage (NO local fallback).
 
     This is the primary way to load data files.
-    Tries S3/R2 first, then falls back to local files.
+    R2 storage MUST be configured - there is no local fallback.
 
     Args:
         filename: CSV filename (e.g., "portal_nil_valuations.csv")
-        subdir: Subdirectory in S3 and locally (default: "processed")
-        cache_hours: How long to cache S3 data
+        subdir: Subdirectory in R2 bucket (default: "processed")
+        cache_hours: How long to cache R2 data locally
         **kwargs: Additional arguments for pd.read_csv
 
     Returns:
         DataFrame
+
+    Raises:
+        R2NotConfiguredError: If R2 is not configured
+        R2DataLoadError: If data cannot be loaded from R2
     """
     s3_key = f"{subdir}/{filename}"
-    config = get_config()
-    local_path = config.data_dir / subdir / filename
-
-    return load_csv_with_fallback(s3_key, local_path, cache_hours, **kwargs)
+    return load_csv_with_fallback(s3_key, None, cache_hours, **kwargs)
 
 
 def _merge_headshots(df: pd.DataFrame) -> pd.DataFrame:

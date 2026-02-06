@@ -1,7 +1,8 @@
 """S3/R2 Storage Client for FastAPI ML Engine.
 
 Handles loading data files from Cloudflare R2 (S3-compatible) storage.
-Falls back to local files during development.
+R2 is REQUIRED - no local fallback. If R2 is not configured or fails,
+endpoints will return errors.
 
 This is the FastAPI version - no Streamlit dependencies.
 """
@@ -240,44 +241,55 @@ def get_s3_client() -> S3StorageClient:
     return _s3_client
 
 
+class R2NotConfiguredError(Exception):
+    """Raised when R2 storage is not properly configured."""
+    pass
+
+
+class R2DataLoadError(Exception):
+    """Raised when data cannot be loaded from R2."""
+    pass
+
+
 def load_csv_with_fallback(
     s3_key: str,
-    local_path: Optional[Path],
+    local_path: Optional[Path] = None,  # Ignored - kept for signature compatibility
     cache_hours: int = 1,
     **pandas_kwargs,
 ) -> pd.DataFrame:
-    """Load CSV from S3, falling back to local file.
+    """Load CSV from R2 storage (NO local fallback).
 
     This is the main function to use throughout the API.
+    R2 storage MUST be configured - there is no local fallback.
 
     Args:
         s3_key: S3 object key (e.g., "processed/portal_nil_valuations.csv")
-        local_path: Local fallback path (can be None for S3-only)
+        local_path: IGNORED - kept for API compatibility
         cache_hours: S3 cache duration
         **pandas_kwargs: Arguments for pd.read_csv
 
     Returns:
         DataFrame
+
+    Raises:
+        R2NotConfiguredError: If R2 credentials are not set
+        R2DataLoadError: If data cannot be loaded from R2
     """
-    # Try S3 first if configured
-    if is_s3_configured():
-        client = get_s3_client()
-        df = client.read_csv(s3_key, cache_hours=cache_hours, **pandas_kwargs)
-        if not df.empty:
-            return df
-        logger.debug(f"S3 read failed for {s3_key}, trying local")
+    if not is_s3_configured():
+        logger.error("R2 storage not configured - check R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY")
+        raise R2NotConfiguredError(
+            "R2 storage is required but not configured. "
+            "Set R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY environment variables."
+        )
 
-    # Fallback to local file
-    if local_path and local_path.exists():
-        try:
-            df = pd.read_csv(local_path, **pandas_kwargs)
-            logger.info(f"Local load {local_path}: {len(df)} rows")
-            return df
-        except Exception as e:
-            logger.error(f"Failed to read local CSV: {local_path} - {e}")
+    client = get_s3_client()
+    df = client.read_csv(s3_key, cache_hours=cache_hours, **pandas_kwargs)
 
-    logger.warning(f"No data available for {s3_key}")
-    return pd.DataFrame()
+    if df.empty:
+        logger.error(f"Failed to load data from R2: {s3_key}")
+        raise R2DataLoadError(f"Could not load data from R2: {s3_key}")
+
+    return df
 
 
 # =============================================================================
@@ -306,24 +318,23 @@ DATA_PATHS = {
 
 
 def load_data(name: str, cache_hours: int = 1, **kwargs) -> pd.DataFrame:
-    """Load a named dataset from S3 or local storage.
+    """Load a named dataset from R2 storage (NO local fallback).
 
     Args:
         name: Dataset name (e.g., "portal_nil_valuations")
-        cache_hours: How long to cache S3 data
+        cache_hours: How long to cache R2 data locally
         **kwargs: Additional pd.read_csv arguments
 
     Returns:
         DataFrame
+
+    Raises:
+        R2NotConfiguredError: If R2 is not configured
+        R2DataLoadError: If data cannot be loaded
+        ValueError: If dataset name is unknown
     """
     if name not in DATA_PATHS:
-        logger.error(f"Unknown dataset: {name}")
-        return pd.DataFrame()
+        raise ValueError(f"Unknown dataset: {name}. Available: {list(DATA_PATHS.keys())}")
 
     s3_key = DATA_PATHS[name]
-
-    # Build local path relative to ml-engine data directory
-    project_root = Path(__file__).parent.parent.parent  # ml-engine/src/utils -> ml-engine
-    local_path = project_root / "data" / s3_key.split("/", 1)[-1]
-
-    return load_csv_with_fallback(s3_key, local_path, cache_hours, **kwargs)
+    return load_csv_with_fallback(s3_key, None, cache_hours, **kwargs)
