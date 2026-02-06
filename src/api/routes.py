@@ -608,7 +608,7 @@ async def portal_active(
     origin_school: Optional[str] = Query(None, description="Filter by origin school"),
     origin_conference: Optional[str] = Query(None, description="Filter by origin conference"),
     min_stars: Optional[int] = Query(None, ge=1, le=5, description="Minimum star rating"),
-    status: Optional[str] = Query("all", regex="^(available|committed|all)$"),
+    status: Optional[str] = Query("all", pattern="^(available|committed|all)$"),
     limit: int = Query(200, ge=1, le=500),
     api_key: str = Depends(require_api_key),
 ):
@@ -1565,7 +1565,7 @@ async def ai_search_status(
 async def search_players(
     request: Request,
     query: str = Query(..., min_length=2, description="Search query"),
-    data_type: str = Query("all", regex="^(nil|portal|all)$", description="Data source to search"),
+    data_type: str = Query("all", pattern="^(nil|portal|all)$", description="Data source to search"),
     limit: int = Query(25, ge=1, le=100),
     api_key: str = Depends(require_api_key),
 ):
