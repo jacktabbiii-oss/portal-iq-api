@@ -358,21 +358,35 @@ async def transfer_impact(
 )
 async def nil_leaderboard(
     request: Request,
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=25000, description="Max results to return (up to 25000)"),
+    offset: int = Query(0, ge=0, description="Skip first N results for pagination"),
     position: Optional[str] = Query(None, description="Filter by position (QB, WR, etc.)"),
     school: Optional[str] = Query(None, description="Filter by school name"),
     conference: Optional[str] = Query(None, description="Filter by conference"),
+    search: Optional[str] = Query(None, description="Search player names"),
     api_key: str = Depends(require_api_key),
 ):
-    """Get NIL leaderboard with real data from Cloudflare R2."""
+    """Get NIL leaderboard with real data from Cloudflare R2.
+
+    Supports pagination via offset/limit and search across all players.
+    """
     try:
-        # Use data_loader which pulls from S3/R2 with local fallback
+        # Get ALL matching players first (no limit) to get total count
         df = get_nil_players(
             position=position,
             school=school,
             conference=conference,
-            limit=limit,
+            limit=50000,  # Get all data
         )
+
+        # Apply search filter if provided
+        if search and not df.empty and "name" in df.columns:
+            df = df[df["name"].str.contains(search, case=False, na=False)]
+
+        total_count = len(df)
+
+        # Apply pagination
+        df = df.iloc[offset:offset + limit]
 
         if df.empty:
             return APIResponse(
@@ -414,10 +428,15 @@ async def nil_leaderboard(
             data={
                 "players": players,
                 "total": len(players),
+                "total_count": total_count,  # Total matching players (for pagination)
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + len(players) < total_count,
                 "filters_applied": {
                     "position": position,
                     "school": school,
                     "conference": conference,
+                    "search": search,
                 }
             }
         )
@@ -445,6 +464,195 @@ async def nil_leaderboard(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to load NIL data: {str(e)}")
+
+
+@router.get(
+    "/players/search",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Search all players",
+    description="Search across NIL and portal data for players by name, school, or position.",
+)
+async def search_players(
+    request: Request,
+    query: str = Query(..., min_length=2, description="Search query (name, school, or position)"),
+    data_type: str = Query("all", pattern="^(nil|portal|all)$", description="Search in nil, portal, or all"),
+    limit: int = Query(50, ge=1, le=500, description="Max results"),
+    api_key: str = Depends(require_api_key),
+):
+    """Search players across all available data.
+
+    This endpoint searches the full dataset (21,000+ players) and returns
+    matching results quickly for autocomplete and search functionality.
+    """
+    try:
+        results = []
+        query_lower = query.lower()
+
+        # Search NIL data
+        if data_type in ("nil", "all"):
+            nil_df = get_nil_players(limit=50000)
+            if not nil_df.empty:
+                # Search name, school, position
+                mask = (
+                    nil_df["name"].str.lower().str.contains(query_lower, na=False) |
+                    nil_df.get("school", pd.Series()).str.lower().str.contains(query_lower, na=False) |
+                    nil_df.get("position", pd.Series()).str.lower().str.contains(query_lower, na=False)
+                )
+                matches = nil_df[mask].head(limit if data_type == "nil" else limit // 2)
+                for _, row in matches.iterrows():
+                    results.append({
+                        "player_id": str(row.get("player_id", row.get("name", "").replace(" ", "_").lower())),
+                        "player_name": str(row.get("name", "")),
+                        "position": str(row.get("position", "")),
+                        "school": str(row.get("school", "")),
+                        "valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                        "nil_tier": str(row.get("tier", "")),
+                        "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                        "source": "nil",
+                    })
+
+        # Search Portal data
+        if data_type in ("portal", "all"):
+            portal_df = get_portal_players(limit=50000)
+            if not portal_df.empty:
+                mask = (
+                    portal_df["name"].str.lower().str.contains(query_lower, na=False) |
+                    portal_df.get("origin_school", pd.Series()).str.lower().str.contains(query_lower, na=False) |
+                    portal_df.get("position", pd.Series()).str.lower().str.contains(query_lower, na=False)
+                )
+                matches = portal_df[mask].head(limit if data_type == "portal" else limit // 2)
+                for _, row in matches.iterrows():
+                    player_name = str(row.get("name", ""))
+                    # Avoid duplicates from NIL search
+                    if not any(r["player_name"] == player_name for r in results):
+                        results.append({
+                            "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
+                            "player_name": player_name,
+                            "position": str(row.get("position", "")),
+                            "school": str(row.get("origin_school", "")),
+                            "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
+                            "status": str(row.get("status", "available")),
+                            "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                            "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                            "source": "portal",
+                        })
+
+        return APIResponse(
+            status="success",
+            data={
+                "players": results[:limit],
+                "total": len(results[:limit]),
+                "query": query,
+                "data_type": data_type,
+            }
+        )
+
+    except R2NotConfiguredError as e:
+        logger.error(f"R2 not configured: {e}")
+        raise HTTPException(status_code=503, detail={"error": "Storage not configured"})
+    except R2DataLoadError as e:
+        logger.error(f"R2 data load failed: {e}")
+        raise HTTPException(status_code=503, detail={"error": "Data unavailable"})
+    except Exception as e:
+        logger.error(f"Player search error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@router.get(
+    "/players/{player_name}/stats",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Get player detailed stats",
+    description="Get all available stats for a specific player.",
+)
+async def get_player_stats(
+    request: Request,
+    player_name: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get detailed stats for a specific player.
+
+    This endpoint returns all available data for a player including
+    NIL valuation, PFF grades, portal status, and recruiting info.
+    """
+    try:
+        player_data = {}
+
+        # Search NIL data
+        nil_df = get_nil_players(limit=50000)
+        if not nil_df.empty:
+            match = nil_df[nil_df["name"].str.lower() == player_name.lower()]
+            if not match.empty:
+                row = match.iloc[0]
+                player_data["nil"] = {
+                    "valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                    "tier": str(row.get("tier", "")),
+                    "valuation_source": str(row.get("valuation_source", "")) if pd.notna(row.get("valuation_source")) else None,
+                }
+                player_data["profile"] = {
+                    "name": str(row.get("name", "")),
+                    "position": str(row.get("position", "")),
+                    "school": str(row.get("school", "")),
+                    "conference": str(row.get("conference")) if pd.notna(row.get("conference")) else None,
+                    "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                    "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
+                    "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
+                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                }
+                # Add PFF stats if available
+                pff_cols = [c for c in row.index if c.startswith("pff_")]
+                if pff_cols:
+                    player_data["pff"] = {
+                        col: float(row[col]) if pd.notna(row[col]) else None
+                        for col in pff_cols
+                    }
+
+        # Search Portal data
+        portal_df = get_portal_players(limit=50000)
+        if not portal_df.empty:
+            match = portal_df[portal_df["name"].str.lower() == player_name.lower()]
+            if not match.empty:
+                row = match.iloc[0]
+                player_data["portal"] = {
+                    "status": str(row.get("status", "")),
+                    "origin_school": str(row.get("origin_school", "")),
+                    "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
+                    "entry_date": str(row.get("entry_date")) if pd.notna(row.get("entry_date")) else None,
+                }
+                # Fill profile if not already from NIL
+                if "profile" not in player_data:
+                    player_data["profile"] = {
+                        "name": str(row.get("name", "")),
+                        "position": str(row.get("position", "")),
+                        "school": str(row.get("origin_school", "")),
+                        "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                    }
+
+        if not player_data:
+            raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
+
+        return APIResponse(
+            status="success",
+            data=player_data,
+        )
+
+    except HTTPException:
+        raise
+    except R2NotConfiguredError as e:
+        logger.error(f"R2 not configured: {e}")
+        raise HTTPException(status_code=503, detail={"error": "Storage not configured"})
+    except R2DataLoadError as e:
+        logger.error(f"R2 data load failed: {e}")
+        raise HTTPException(status_code=503, detail={"error": "Data unavailable"})
+    except Exception as e:
+        logger.error(f"Player stats error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to get player stats: {str(e)}")
 
 
 @router.post(
@@ -609,10 +817,15 @@ async def portal_active(
     origin_conference: Optional[str] = Query(None, description="Filter by origin conference"),
     min_stars: Optional[int] = Query(None, ge=1, le=5, description="Minimum star rating"),
     status: Optional[str] = Query("all", pattern="^(available|committed|all)$"),
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=25000, description="Max results (up to 25000)"),
+    offset: int = Query(0, ge=0, description="Skip first N results for pagination"),
+    search: Optional[str] = Query(None, description="Search player names"),
     api_key: str = Depends(require_api_key),
 ):
-    """Get active transfer portal players with real data from Cloudflare R2."""
+    """Get active transfer portal players with real data from Cloudflare R2.
+
+    Supports pagination via offset/limit and search across all portal players.
+    """
     try:
         # Map status to filter
         status_filter = None
@@ -621,15 +834,24 @@ async def portal_active(
         elif status == "committed":
             status_filter = "Committed"
 
-        # Use data_loader which pulls from S3/R2
+        # Use data_loader which pulls from S3/R2 - get ALL matching data
         df = get_portal_players(
             status=status_filter,
             position=position,
             origin_school=origin_school,
             origin_conference=origin_conference,
             min_stars=min_stars,
-            limit=limit,
+            limit=50000,  # Get all data
         )
+
+        # Apply search filter if provided
+        if search and not df.empty and "name" in df.columns:
+            df = df[df["name"].str.contains(search, case=False, na=False)]
+
+        total_count = len(df)
+
+        # Apply pagination
+        df = df.iloc[offset:offset + limit]
 
         if df.empty:
             return APIResponse(
@@ -675,10 +897,15 @@ async def portal_active(
             data={
                 "players": players,
                 "total": len(players),
+                "total_count": total_count,  # Total matching players (for pagination)
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + len(players) < total_count,
                 "filters_applied": {
                     "position": position,
                     "origin_school": origin_school,
                     "status": status,
+                    "search": search,
                 }
             }
         )
@@ -1565,7 +1792,7 @@ async def ai_search_status(
 async def search_players(
     request: Request,
     query: str = Query(..., min_length=2, description="Search query"),
-    data_type: str = Query("all", pattern="^(nil|portal|all)$", description="Data source to search"),
+    data_type: str = Query("all", regex="^(nil|portal|all)$", description="Data source to search"),
     limit: int = Query(25, ge=1, le=100),
     api_key: str = Depends(require_api_key),
 ):

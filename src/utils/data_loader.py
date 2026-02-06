@@ -130,7 +130,7 @@ def get_nil_players(
     conference: Optional[str] = None,
     min_value: Optional[float] = None,
     max_value: Optional[float] = None,
-    limit: int = 200,
+    limit: int = 50000,  # Default to all data
 ) -> pd.DataFrame:
     """Get NIL player data with valuations and headshots.
 
@@ -274,7 +274,7 @@ def get_portal_players(
     origin_school: Optional[str] = None,
     origin_conference: Optional[str] = None,
     min_stars: Optional[int] = None,
-    limit: int = 100,
+    limit: int = 50000,  # Default to all data
 ) -> pd.DataFrame:
     """Get transfer portal player data.
 
