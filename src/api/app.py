@@ -564,16 +564,19 @@ app.openapi = custom_openapi
 
 
 # =============================================================================
-# Run with uvicorn (for development)
+# Run with uvicorn
 # =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
 
+    # Railway sets PORT env var - use it if available
+    port = int(os.getenv("PORT", "8000"))
+
     uvicorn.run(
         "src.api.app:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=not IS_PRODUCTION,
         log_level="info",
     )
