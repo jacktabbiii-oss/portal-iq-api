@@ -766,13 +766,34 @@ async def portal_active(
 
         total_count = len(df)
 
+        # Calculate portal stats BEFORE pagination (on full filtered dataset)
+        active_in_portal = 0
+        committed_count = 0
+        schools_active = 0
+
+        if not df.empty and "status" in df.columns:
+            status_lower = df["status"].str.lower()
+            active_in_portal = int((status_lower == "entered").sum() + (status_lower == "available").sum())
+            committed_count = int((status_lower == "committed").sum())
+
+            # Count unique origin schools
+            if "origin_school" in df.columns:
+                schools_active = int(df["origin_school"].nunique())
+
         # Apply pagination
         df = df.iloc[offset:offset + limit]
 
         if df.empty:
             return APIResponse(
                 status="success",
-                data={"players": [], "total": 0},
+                data={
+                    "players": [],
+                    "total": 0,
+                    "total_count": total_count,
+                    "active_in_portal": active_in_portal,
+                    "committed": committed_count,
+                    "schools_active": schools_active,
+                },
                 message="No portal players found matching criteria"
             )
 
@@ -814,6 +835,9 @@ async def portal_active(
                 "players": players,
                 "total": len(players),
                 "total_count": total_count,  # Total matching players (for pagination)
+                "active_in_portal": active_in_portal,  # Players still in portal
+                "committed": committed_count,          # Players who committed
+                "schools_active": schools_active,      # Unique origin schools
                 "offset": offset,
                 "limit": limit,
                 "has_more": offset + len(players) < total_count,
