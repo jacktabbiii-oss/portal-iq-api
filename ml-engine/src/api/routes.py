@@ -385,13 +385,21 @@ async def nil_leaderboard(
 
         total_count = len(df)
 
+        # Calculate market stats BEFORE pagination (on full filtered dataset)
+        if "nil_value" in df.columns and not df.empty:
+            market_cap = float(df["nil_value"].sum())
+            avg_value = float(df["nil_value"].mean())
+        else:
+            market_cap = 0.0
+            avg_value = 0.0
+
         # Apply pagination
         df = df.iloc[offset:offset + limit]
 
         if df.empty:
             return APIResponse(
                 status="success",
-                data={"players": [], "total": 0},
+                data={"players": [], "total": 0, "total_count": total_count, "avg_value": avg_value, "market_cap": market_cap},
                 message="No players found matching criteria"
             )
 
@@ -429,6 +437,8 @@ async def nil_leaderboard(
                 "players": players,
                 "total": len(players),
                 "total_count": total_count,  # Total matching players (for pagination)
+                "avg_value": avg_value,      # Average NIL value across all filtered players
+                "market_cap": market_cap,    # Sum of all NIL values across all filtered players
                 "offset": offset,
                 "limit": limit,
                 "has_more": offset + len(players) < total_count,
@@ -559,100 +569,6 @@ async def search_players(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
-
-@router.get(
-    "/players/{player_name}/stats",
-    response_model=APIResponse,
-    tags=["Players"],
-    summary="Get player detailed stats",
-    description="Get all available stats for a specific player.",
-)
-async def get_player_stats(
-    request: Request,
-    player_name: str,
-    api_key: str = Depends(require_api_key),
-):
-    """Get detailed stats for a specific player.
-
-    This endpoint returns all available data for a player including
-    NIL valuation, PFF grades, portal status, and recruiting info.
-    """
-    try:
-        player_data = {}
-
-        # Search NIL data
-        nil_df = get_nil_players(limit=50000)
-        if not nil_df.empty:
-            match = nil_df[nil_df["name"].str.lower() == player_name.lower()]
-            if not match.empty:
-                row = match.iloc[0]
-                player_data["nil"] = {
-                    "valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
-                    "tier": str(row.get("tier", "")),
-                    "valuation_source": str(row.get("valuation_source", "")) if pd.notna(row.get("valuation_source")) else None,
-                }
-                player_data["profile"] = {
-                    "name": str(row.get("name", "")),
-                    "position": str(row.get("position", "")),
-                    "school": str(row.get("school", "")),
-                    "conference": str(row.get("conference")) if pd.notna(row.get("conference")) else None,
-                    "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                    "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
-                    "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
-                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
-                }
-                # Add PFF stats if available
-                pff_cols = [c for c in row.index if c.startswith("pff_")]
-                if pff_cols:
-                    player_data["pff"] = {
-                        col: float(row[col]) if pd.notna(row[col]) else None
-                        for col in pff_cols
-                    }
-
-        # Search Portal data
-        portal_df = get_portal_players(limit=50000)
-        if not portal_df.empty:
-            match = portal_df[portal_df["name"].str.lower() == player_name.lower()]
-            if not match.empty:
-                row = match.iloc[0]
-                player_data["portal"] = {
-                    "status": str(row.get("status", "")),
-                    "origin_school": str(row.get("origin_school", "")),
-                    "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
-                    "entry_date": str(row.get("entry_date")) if pd.notna(row.get("entry_date")) else None,
-                }
-                # Fill profile if not already from NIL
-                if "profile" not in player_data:
-                    player_data["profile"] = {
-                        "name": str(row.get("name", "")),
-                        "position": str(row.get("position", "")),
-                        "school": str(row.get("origin_school", "")),
-                        "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
-                    }
-
-        if not player_data:
-            raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
-
-        return APIResponse(
-            status="success",
-            data=player_data,
-        )
-
-    except HTTPException:
-        raise
-    except R2NotConfiguredError as e:
-        logger.error(f"R2 not configured: {e}")
-        raise HTTPException(status_code=503, detail={"error": "Storage not configured"})
-    except R2DataLoadError as e:
-        logger.error(f"R2 data load failed: {e}")
-        raise HTTPException(status_code=503, detail={"error": "Data unavailable"})
-    except Exception as e:
-        logger.error(f"Player stats error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to get player stats: {str(e)}")
 
 
 @router.post(
@@ -1913,8 +1829,8 @@ async def get_player_stats(
         player_name = unquote(player_name)
         player_name_lower = player_name.lower()
 
-        # Search in NIL data first
-        nil_df = get_nil_players(limit=500)
+        # Search in NIL data first - use full dataset to find any player
+        nil_df = get_nil_players(limit=50000)
         player_row = None
 
         if not nil_df.empty:
@@ -1925,7 +1841,7 @@ async def get_player_stats(
 
         # If not found in NIL, check portal
         if player_row is None:
-            portal_df = get_portal_players(limit=500)
+            portal_df = get_portal_players(limit=50000)
             if not portal_df.empty:
                 mask = portal_df["name"].str.lower() == player_name_lower
                 matches = portal_df[mask]
