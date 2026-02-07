@@ -1303,6 +1303,109 @@ async def mock_draft(
     )
 
 
+@router.get(
+    "/draft/project/{player_name}",
+    response_model=APIResponse,
+    tags=["Draft"],
+    summary="Project draft position for player",
+    description="Get NFL draft projection for a specific player by name.",
+)
+async def draft_project_by_name(
+    request: Request,
+    player_name: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Project draft position for a player by name."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+
+        from ..models.draft_projector import project_draft_position
+        from ..utils.data_loader import get_nil_players
+
+        # Find player in NIL data
+        nil_df = get_nil_players(limit=50000)
+        player_data = {}
+
+        if not nil_df.empty and "name" in nil_df.columns:
+            match = nil_df[nil_df["name"].str.contains(player_name, case=False, na=False)]
+            if not match.empty:
+                player_data = match.iloc[0].to_dict()
+
+        if not player_data:
+            raise HTTPException(status_code=404, detail=f"Player not found: {player_name}")
+
+        projection = project_draft_position(player_data)
+
+        return APIResponse(
+            status="success",
+            data=projection,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Draft projection error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/draft/comparables/{player_name}",
+    response_model=APIResponse,
+    tags=["Draft"],
+    summary="Get draft comparables",
+    description="Get historical draft comparables for a player.",
+)
+async def draft_comparables(
+    request: Request,
+    player_name: str,
+    limit: int = Query(5, ge=1, le=20, description="Max comparables"),
+    api_key: str = Depends(require_api_key),
+):
+    """Get historical draft comparables for a player."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+
+        from ..models.draft_projector import get_historical_comparables
+        from ..utils.data_loader import get_nil_players
+
+        # Find player in NIL data
+        nil_df = get_nil_players(limit=50000)
+        player_data = {}
+
+        if not nil_df.empty and "name" in nil_df.columns:
+            match = nil_df[nil_df["name"].str.contains(player_name, case=False, na=False)]
+            if not match.empty:
+                player_data = match.iloc[0].to_dict()
+
+        if not player_data:
+            return APIResponse(
+                status="success",
+                data={"player": player_name, "comparables": []},
+            )
+
+        comparables = get_historical_comparables(player_data, limit=limit)
+
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": player_data.get("position", "Unknown"),
+                "comparables": comparables,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Draft comparables error: {e}")
+        return APIResponse(
+            status="success",
+            data={"player": player_name, "comparables": []},
+        )
+
+
 # =============================================================================
 # Roster Endpoints
 # =============================================================================

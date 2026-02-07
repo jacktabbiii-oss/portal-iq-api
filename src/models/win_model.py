@@ -37,6 +37,17 @@ try:
 except ImportError:
     HAS_LIGHTGBM = False
 
+# Import elite traits bonus calculator (top 10% athletes contribute more wins)
+try:
+    from models.elite_traits import calculate_elite_bonus, get_athletic_profile
+    HAS_ELITE_TRAITS = True
+except ImportError:
+    try:
+        from .elite_traits import calculate_elite_bonus, get_athletic_profile
+        HAS_ELITE_TRAITS = True
+    except ImportError:
+        HAS_ELITE_TRAITS = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -737,6 +748,13 @@ class WinImpactModel:
         # Calculate WAR (wins above replacement)
         war = (par / 10) * coef * (weight / 0.08)  # Normalized to 0.08 base weight
 
+        # Apply elite traits bonus (top 10% athletes contribute more wins)
+        # Elite athletes maximize their production potential
+        if HAS_ELITE_TRAITS:
+            player_dict = player.to_dict() if hasattr(player, 'to_dict') else dict(player)
+            elite_mult = calculate_elite_bonus(player_dict, position)
+            war = war * elite_mult
+
         return round(war, 3)
 
     def player_win_value(
@@ -787,7 +805,7 @@ class WinImpactModel:
                 better = (pos_players['production_score'] > production).sum()
                 team_rank = better + 1
 
-        return {
+        result = {
             'player_name': str(player_name),
             'position': position,
             'production_score': round(production, 1),
@@ -799,6 +817,19 @@ class WinImpactModel:
             'team_position_rank': team_rank,
             'interpretation': self._interpret_war(war, position),
         }
+
+        # Add elite traits profile if available
+        if HAS_ELITE_TRAITS:
+            player_dict = player_features.to_dict() if hasattr(player_features, 'to_dict') else dict(player_features)
+            profile = get_athletic_profile(player_dict, position)
+            result['athletic_profile'] = {
+                'tier': profile['tier'],
+                'tier_label': profile['tier_label'],
+                'elite_bonus': profile['elite_bonus'],
+                'elite_traits': profile['elite_traits'],
+            }
+
+        return result
 
     def _rate_nil_efficiency(self, nil_per_win: float) -> str:
         """Rate NIL efficiency (cost per win)."""

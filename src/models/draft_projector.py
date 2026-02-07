@@ -47,6 +47,27 @@ try:
 except ImportError:
     HAS_SHAP = False
 
+# Import elite traits bonus calculator (top 10% measurables get draft boost)
+try:
+    from models.elite_traits import (
+        calculate_elite_bonus,
+        calculate_draft_adjustment,
+        get_athletic_profile,
+        is_elite_athlete,
+    )
+    HAS_ELITE_TRAITS = True
+except ImportError:
+    try:
+        from .elite_traits import (
+            calculate_elite_bonus,
+            calculate_draft_adjustment,
+            get_athletic_profile,
+            is_elite_athlete,
+        )
+        HAS_ELITE_TRAITS = True
+    except ImportError:
+        HAS_ELITE_TRAITS = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -634,6 +655,17 @@ class DraftProjector:
         if will_be_drafted and self.round_model is not None:
             predicted_pick = self.round_model.predict(X_scaled)[0]
             predicted_pick = int(np.clip(predicted_pick, 1, 260))
+
+            # Apply elite traits draft adjustment (top 10% athletes move up)
+            elite_adjustment = 0
+            elite_profile = None
+            if HAS_ELITE_TRAITS:
+                player_dict = self._features_to_dict(player_features)
+                elite_adjustment = calculate_draft_adjustment(player_dict, position)
+                elite_profile = get_athletic_profile(player_dict, position)
+                # Apply adjustment (negative = move up)
+                predicted_pick = max(1, predicted_pick + elite_adjustment)
+
             projected_round = pick_to_round(predicted_pick)
 
             # Calculate pick range (early/mid/late within predicted round)
@@ -648,6 +680,8 @@ class DraftProjector:
             predicted_pick = 0
             projected_round = 0
             pick_range = {'early': 0, 'mid': 0, 'late': 0}
+            elite_adjustment = 0
+            elite_profile = None
 
         # Get comparable draft picks
         comparables = self._find_comparable_picks(X_scaled, player_features)
@@ -664,7 +698,7 @@ class DraftProjector:
         # SHAP explanation
         shap_explanation = self._get_shap_explanation(X_scaled)
 
-        return {
+        result = {
             'player_name': player_name,
             'will_be_drafted': will_be_drafted,
             'draft_probability': round(draft_prob, 3),
@@ -676,6 +710,19 @@ class DraftProjector:
             'draft_stock_factors': stock_factors,
             'shap_explanation': shap_explanation,
         }
+
+        # Add elite traits profile if available (top 10% athletes get draft boost)
+        if elite_profile is not None:
+            result['elite_traits'] = {
+                'tier': elite_profile['tier'],
+                'tier_label': elite_profile['tier_label'],
+                'elite_bonus': elite_profile['elite_bonus'],
+                'draft_adjustment': elite_adjustment,
+                'elite_trait_count': elite_profile['elite_trait_count'],
+                'elite_traits': elite_profile['elite_traits'],
+            }
+
+        return result
 
     def _prepare_prediction_input(
         self,
@@ -723,6 +770,19 @@ class DraftProjector:
             if col in features.index and pd.notna(features[col]):
                 return str(features[col])
         return 'ATH'
+
+    def _features_to_dict(self, features: Union[pd.Series, pd.DataFrame, Dict]) -> Dict[str, Any]:
+        """Convert features to dictionary for elite traits calculation."""
+
+        if isinstance(features, dict):
+            return features
+        elif isinstance(features, pd.DataFrame):
+            if len(features) == 1:
+                return features.iloc[0].to_dict()
+            return features.to_dict('records')[0]
+        elif isinstance(features, pd.Series):
+            return features.to_dict()
+        return {}
 
     def _find_comparable_picks(
         self,
@@ -873,12 +933,26 @@ class DraftProjector:
         elif age >= 24:
             hurts.append(STOCK_FACTOR_DESCRIPTIONS['older_age'])
 
-        # Measurables
-        ras_score = player_features.get('ras_score', 50)
-        if ras_score >= 75:
-            helps.append(STOCK_FACTOR_DESCRIPTIONS['good_measurables'])
-        elif ras_score < 40:
-            hurts.append(STOCK_FACTOR_DESCRIPTIONS['below_avg_measurables'])
+        # Measurables - use elite traits system if available
+        if HAS_ELITE_TRAITS:
+            player_dict = player_features.to_dict() if hasattr(player_features, 'to_dict') else dict(player_features)
+            position = player_dict.get('position_group', player_dict.get('position', 'ATH'))
+            elite_bonus = calculate_elite_bonus(player_dict, position)
+
+            if elite_bonus >= 1.25:
+                helps.append("Elite athlete (top 10% measurables)")
+            elif elite_bonus >= 1.15:
+                helps.append(STOCK_FACTOR_DESCRIPTIONS['good_measurables'])
+            elif elite_bonus >= 1.08:
+                helps.append("Above-average athletic testing")
+            # No penalty for average - only reward elite
+        else:
+            # Fallback to simple RAS check
+            ras_score = player_features.get('ras_score', 50)
+            if ras_score >= 75:
+                helps.append(STOCK_FACTOR_DESCRIPTIONS['good_measurables'])
+            elif ras_score < 40:
+                hurts.append(STOCK_FACTOR_DESCRIPTIONS['below_avg_measurables'])
 
         # Recruiting
         stars = player_features.get('recruiting_stars', 3)

@@ -21,6 +21,17 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# Import elite traits bonus calculator (top 10% measurables get boost)
+try:
+    from models.elite_traits import calculate_elite_bonus, get_athletic_profile
+    ELITE_TRAITS_AVAILABLE = True
+except ImportError:
+    try:
+        from .elite_traits import calculate_elite_bonus, get_athletic_profile
+        ELITE_TRAITS_AVAILABLE = True
+    except ImportError:
+        ELITE_TRAITS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,6 +189,13 @@ class NILValuationModel:
             market = row.get("market_factor", 1.0)
             base_value *= market
 
+            # Apply elite traits bonus (top 10% measurables only)
+            # Average athletes get 1.0 (no change), elite get up to 1.25 (+25%)
+            if ELITE_TRAITS_AVAILABLE:
+                position = row.get("position", "")
+                elite_mult = calculate_elite_bonus(row.to_dict(), position)
+                base_value *= elite_mult
+
             values.loc[idx] = base_value
 
         return values.clip(5_000, 5_000_000)
@@ -269,7 +287,7 @@ def valuate_player(
         model: Optional trained model
 
     Returns:
-        Valuation result
+        Valuation result with elite traits info
     """
     if model is None:
         model = NILValuationModel()
@@ -278,7 +296,7 @@ def valuate_player(
     value = model.predict(df).iloc[0]
     tier = model.get_tier(value)
 
-    return {
+    result = {
         "player_name": player_data.get("player_name", "Unknown"),
         "position": player_data.get("position", ""),
         "school": player_data.get("school", ""),
@@ -286,3 +304,16 @@ def valuate_player(
         "nil_tier": tier,
         "confidence": "medium",
     }
+
+    # Add elite athlete profile if available
+    if ELITE_TRAITS_AVAILABLE:
+        position = player_data.get("position", "")
+        profile = get_athletic_profile(player_data, position)
+        result["athletic_profile"] = {
+            "tier": profile["tier"],
+            "tier_label": profile["tier_label"],
+            "elite_bonus": profile["elite_bonus"],
+            "elite_traits": profile["elite_traits"],
+        }
+
+    return result

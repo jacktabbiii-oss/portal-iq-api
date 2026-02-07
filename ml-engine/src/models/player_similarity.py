@@ -503,8 +503,25 @@ def _filter_by_position(df: pd.DataFrame, position: str) -> pd.DataFrame:
 
 def _get_nfl_outcome(player_name: str, player_data: Dict[str, Any]) -> Dict[str, Any]:
     """Get NFL career outcome for a player."""
-    # This would be enhanced with draft data, career stats, etc.
-    # For now, return basic info from the data we have
+    # Try to get draft data
+    try:
+        from .draft_projector import get_player_draft_outcome
+        draft_outcome = get_player_draft_outcome(player_name)
+        if draft_outcome:
+            return {
+                "team": draft_outcome.get("team") or player_data.get("team"),
+                "seasons_played": player_data.get("seasons_played", 1),
+                "draft_round": draft_outcome.get("round"),
+                "draft_pick": draft_outcome.get("overall"),
+                "draft_year": draft_outcome.get("year"),
+                "contract_value": draft_outcome.get("contract_value"),
+                "guaranteed": draft_outcome.get("guaranteed"),
+                "career_highlights": player_data.get("career_highlights", []),
+            }
+    except Exception:
+        pass
+
+    # Fall back to basic info from the data we have
     return {
         "team": player_data.get("team"),
         "seasons_played": player_data.get("seasons_played", 1),
