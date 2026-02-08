@@ -427,6 +427,87 @@ def get_player_pff_stats(player_name: str, season: int = 2025) -> Optional[Dict[
         "stops": safe_float(row.get("stops")),
         "tackles_for_loss": safe_float(row.get("tackles_for_loss")),
         "missed_tackles": safe_float(row.get("missed_tackles")),
+
+        # =======================================================================
+        # HIGH-VALUE UNDERUTILIZED COLUMNS (Added Feb 2026)
+        # These are the top predictive metrics we weren't using
+        # =======================================================================
+
+        # WR Dominance - How well QB performs when targeting this receiver
+        "targeted_qb_rating": safe_float(row.get("targeted_qb_rating")),
+        "man_targeted_qb_rating": safe_float(row.get("man_targeted_qb_rating")),
+        "zone_targeted_qb_rating": safe_float(row.get("zone_targeted_qb_rating")),
+
+        # True Pass Set (more accurate than general pass block - excludes scrambles)
+        "true_pass_set_grades_pass_block": safe_float(row.get("true_pass_set_grades_pass_block")),
+        "true_pass_set_pbe": safe_float(row.get("true_pass_set_pbe")),  # Pass block efficiency
+        "true_pass_set_pressures_allowed": safe_float(row.get("true_pass_set_pressures_allowed")),
+        "true_pass_set_sacks_allowed": safe_float(row.get("true_pass_set_sacks_allowed")),
+
+        # Pressure Situation Performance (key NFL predictor)
+        "pressure_grades_pass": safe_float(row.get("pressure_grades_pass")),
+        "pressure_yards": safe_float(row.get("pressure_yards")),
+        "pressure_first_downs": safe_float(row.get("pressure_first_downs")),
+        "no_pressure_completion_pct": safe_float(row.get("no_pressure_completion_percent")),
+        "no_pressure_qb_rating": safe_float(row.get("no_pressure_qb_rating")),
+
+        # Blitz Situation Performance
+        "blitz_completion_pct": safe_float(row.get("blitz_completion_pct")),
+        "blitz_yards_per_attempt": safe_float(row.get("blitz_yards_per_attempt")),
+        "blitz_grades_pass": safe_float(row.get("blitz_grades_pass")),
+        "no_blitz_completion_pct": safe_float(row.get("no_blitz_completion_pct")),
+
+        # Coverage Efficiency (per-snap is more predictive than per-game)
+        "coverage_snaps_per_target": safe_float(row.get("coverage_snaps_per_target")),
+        "coverage_snaps_per_reception": safe_float(row.get("coverage_snaps_per_reception")),
+
+        # Man vs Zone Coverage Breakdown (critical for DBs)
+        "man_grades_coverage_defense": safe_float(row.get("man_grades_coverage_defense")),
+        "man_caught_percent": safe_float(row.get("man_caught_percent")),
+        "man_yards_per_coverage_snap": safe_float(row.get("man_yards_per_coverage_snap")),
+        "zone_grades_coverage_defense": safe_float(row.get("zone_grades_coverage_defense")),
+        "zone_caught_percent": safe_float(row.get("zone_caught_percent")),
+        "zone_yards_per_coverage_snap": safe_float(row.get("zone_yards_per_coverage_snap")),
+
+        # Pass Rush by Side (technique specificity)
+        "lhs_pass_rush_productivity": safe_float(row.get("lhs_prp")),
+        "lhs_pass_rush_win_rate": safe_float(row.get("lhs_pass_rush_percent")),
+        "rhs_pass_rush_productivity": safe_float(row.get("rhs_prp")),
+        "rhs_pass_rush_win_rate": safe_float(row.get("rhs_pass_rush_percent")),
+
+        # Ball Security / Turnovers
+        "forced_fumbles": safe_float(row.get("forced_fumbles")),
+        "fumble_recoveries": safe_float(row.get("fumble_recoveries")),
+        "fumbles": safe_float(row.get("fumbles")),
+        "grades_hands_drop": safe_float(row.get("grades_hands_drop")),
+        "grades_hands_fumble": safe_float(row.get("grades_hands_fumble")),
+
+        # Route Distribution (WR specialization)
+        "route_rate": safe_float(row.get("route_rate")),
+        "slot_rate": safe_float(row.get("slot_rate")),
+        "wide_rate": safe_float(row.get("wide_rate")),
+        "inline_rate": safe_float(row.get("inline_rate")),
+
+        # Explosive Plays
+        "explosive": safe_float(row.get("explosive")),
+        "breakaway_yards": safe_float(row.get("breakaway_yards")),
+        "breakaway_attempts": safe_float(row.get("breakaway_attempts")),
+        "longest": safe_float(row.get("longest")),
+
+        # Snap Count Distribution (usage/versatility)
+        "snap_counts_offense": safe_float(row.get("snap_counts_offense")),
+        "snap_counts_defense": safe_float(row.get("snap_counts_defense")),
+        "snap_counts_coverage": safe_float(row.get("snap_counts_coverage")),
+        "snap_counts_pass_rush": safe_float(row.get("snap_counts_pass_rush")),
+
+        # Run Blocking Scheme Analysis (OL evaluation)
+        "gap_grades_run_block": safe_float(row.get("gap_grades_run_block")),
+        "zone_grades_run_block": safe_float(row.get("zone_grades_run_block")),
+
+        # Penalties (discipline indicator)
+        "penalties": safe_float(row.get("penalties")),
+        "grades_offense_penalty": safe_float(row.get("grades_offense_penalty")),
+        "grades_defense_penalty": safe_float(row.get("grades_defense_penalty")),
     }
 
     return stats
@@ -667,6 +748,213 @@ def get_conferences() -> List[str]:
         "SEC", "Big Ten", "Big 12", "ACC", "Pac-12",
         "Mountain West", "AAC", "Sun Belt", "MAC", "C-USA"
     ]
+
+
+# =============================================================================
+# Dual NIL Valuation (On3 + Portal IQ)
+# =============================================================================
+
+def get_player_dual_valuation(player_name: str) -> Optional[Dict[str, Any]]:
+    """Get both On3 actual NIL value and Portal IQ predicted value with reasoning.
+
+    Args:
+        player_name: Player name to search for
+
+    Returns:
+        Dict with on3_value, portal_iq_value, value_breakdown, and reasoning
+    """
+    # Import CustomNILValuator lazily to avoid circular imports
+    import sys
+    import importlib.util
+    from pathlib import Path
+
+    # Get the path to custom_nil_valuator.py
+    models_path = Path(__file__).parent.parent / "models" / "custom_nil_valuator.py"
+    spec = importlib.util.spec_from_file_location("custom_nil_valuator", models_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    CustomNILValuator = module.CustomNILValuator
+
+    # Find player in NIL data
+    df = get_nil_players(limit=50000)
+    if df.empty:
+        return None
+
+    player_name_lower = player_name.lower()
+    mask = df["name"].str.lower() == player_name_lower
+    matches = df[mask]
+
+    if matches.empty:
+        # Try contains match
+        mask = df["name"].str.lower().str.contains(player_name_lower, na=False)
+        matches = df[mask]
+        if matches.empty:
+            return None
+
+    player_row = matches.iloc[0]
+
+    # Get On3 actual value (if this player has one)
+    nil_value = float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else 0
+    is_predicted = player_row.get("is_predicted", True)
+
+    on3_value = nil_value if not is_predicted else None
+
+    # Calculate Portal IQ predicted value using our formula
+    # Use calibration factor to align with market (On3 valuations)
+    valuator = CustomNILValuator(calibration_factor=1.8)
+
+    # Get PFF stats if available - these contain the REAL production numbers
+    pff_stats = get_player_pff_stats(player_name)
+
+    # Get player attributes
+    position = str(player_row.get("position", "ATH"))
+    school = str(player_row.get("school", ""))
+    stars = int(player_row.get("stars", 0)) if pd.notna(player_row.get("stars")) else 0
+
+    # Extract actual production stats from PFF data
+    games_played = 0
+    passing_yards = 0
+    passing_tds = 0
+    rushing_yards = 0
+    rushing_tds = 0
+    receiving_yards = 0
+    receiving_tds = 0
+    tackles = 0
+    sacks = 0
+    interceptions = 0
+    pff_grade = None
+
+    if pff_stats:
+        games_played = int(pff_stats.get("games_played") or 12)
+
+        # Use position-specific grades (more accurate than overall)
+        if position == "QB":
+            pff_grade = pff_stats.get("pff_passing") or pff_stats.get("pff_offense") or pff_stats.get("pff_overall")
+        elif position in ("WR", "TE"):
+            pff_grade = pff_stats.get("pff_receiving") or pff_stats.get("pff_offense") or pff_stats.get("pff_overall")
+        elif position == "RB":
+            pff_grade = pff_stats.get("pff_rushing") or pff_stats.get("pff_offense") or pff_stats.get("pff_overall")
+        elif position in ("EDGE", "DT", "DL", "DE"):
+            pff_grade = pff_stats.get("pff_pass_rush") or pff_stats.get("pff_defense") or pff_stats.get("pff_overall")
+        elif position in ("CB", "S"):
+            pff_grade = pff_stats.get("pff_coverage") or pff_stats.get("pff_defense") or pff_stats.get("pff_overall")
+        elif position in ("OT", "OG", "C", "OL", "IOL"):
+            pff_grade = pff_stats.get("pff_pass_block") or pff_stats.get("pff_offense") or pff_stats.get("pff_overall")
+        else:
+            pff_grade = pff_stats.get("pff_overall")
+
+        # Get actual production stats
+        receiving_yards = int(pff_stats.get("rec_yards") or 0)
+        receiving_tds = int(pff_stats.get("touchdowns") or 0) if position in ("WR", "TE", "RB") else 0
+        rushing_yards = int(pff_stats.get("yards") or 0) if position in ("RB", "QB") else 0
+        rushing_tds = int(pff_stats.get("touchdowns") or 0) if position == "RB" else 0
+        passing_yards = int(pff_stats.get("yards") or 0) if position == "QB" else 0
+        passing_tds = int(pff_stats.get("touchdowns") or 0) if position == "QB" else 0
+        sacks = float(pff_stats.get("sacks") or 0)
+        interceptions = int(pff_stats.get("interceptions") or 0) if position in ("CB", "S", "LB") else 0
+        tackles = int(pff_stats.get("tackles") or 0)
+
+    # Determine if starter based on production/grade
+    is_starter = False
+    if pff_grade and pff_grade > 70:
+        is_starter = True
+    elif receiving_yards > 500 or rushing_yards > 400 or passing_yards > 1500:
+        is_starter = True
+    elif sacks > 3 or interceptions > 2:
+        is_starter = True
+
+    # Calculate Portal IQ valuation with FULL stats
+    valuation = valuator.calculate_valuation(
+        player_name=player_name,
+        position=position,
+        school=school,
+        games_played=games_played,
+        games_started=games_played if is_starter else 0,
+        passing_yards=passing_yards,
+        passing_tds=passing_tds,
+        rushing_yards=rushing_yards,
+        rushing_tds=rushing_tds,
+        receiving_yards=receiving_yards,
+        receiving_tds=receiving_tds,
+        tackles=tackles,
+        sacks=sacks,
+        interceptions=interceptions,
+        pff_grade=pff_grade,
+        recruiting_stars=stars,
+        is_starter=is_starter,
+    )
+
+    portal_iq_value = valuation.total_valuation
+
+    # Build value breakdown for reasoning
+    value_breakdown = {
+        "position_base": valuation.factors.get("position_base", 0),
+        "performance_multiplier": round(valuation.factors.get("performance_multiplier", 1.0), 2),
+        "school_multiplier": round(valuation.factors.get("school_multiplier", 1.0), 2),
+        "social_value": valuation.factors.get("social_value", 0),
+        "potential_value": valuation.factors.get("potential_value", 0),
+        "starter_bonus": round(valuation.factors.get("starter_bonus", 1.0), 2),
+    }
+
+    # Generate human-readable reasoning
+    reasoning_parts = []
+
+    # Position reasoning
+    reasoning_parts.append(f"{position} position base value: ${value_breakdown['position_base']:,.0f}")
+
+    # School reasoning
+    school_mult = value_breakdown['school_multiplier']
+    if school_mult >= 2.5:
+        reasoning_parts.append(f"{school} is a blue-blood program ({school_mult:.1f}x multiplier)")
+    elif school_mult >= 1.8:
+        reasoning_parts.append(f"{school} is an elite program ({school_mult:.1f}x multiplier)")
+    elif school_mult >= 1.3:
+        reasoning_parts.append(f"{school} is a strong Power 4 program ({school_mult:.1f}x multiplier)")
+    elif school_mult < 1.0:
+        reasoning_parts.append(f"{school} has limited NIL market ({school_mult:.1f}x multiplier)")
+
+    # Performance reasoning
+    perf_mult = value_breakdown['performance_multiplier']
+    if pff_grade:
+        if pff_grade >= 90:
+            reasoning_parts.append(f"Elite PFF grade ({pff_grade:.1f}) adds significant value")
+        elif pff_grade >= 80:
+            reasoning_parts.append(f"Strong PFF grade ({pff_grade:.1f}) boosts valuation")
+        elif pff_grade >= 70:
+            reasoning_parts.append(f"Solid PFF grade ({pff_grade:.1f}) supports value")
+        else:
+            reasoning_parts.append(f"PFF grade ({pff_grade:.1f}) limits upside")
+
+    # Recruiting reasoning
+    if stars >= 5:
+        reasoning_parts.append(f"5-star recruit commands premium floor value")
+    elif stars >= 4:
+        reasoning_parts.append(f"4-star recruit has strong market appeal")
+
+    # Compare values if we have both
+    if on3_value and portal_iq_value:
+        diff = portal_iq_value - on3_value
+        diff_pct = (diff / on3_value) * 100 if on3_value > 0 else 0
+
+        if abs(diff_pct) < 10:
+            reasoning_parts.append(f"Portal IQ value closely matches On3 ({diff_pct:+.1f}%)")
+        elif diff > 0:
+            reasoning_parts.append(f"Portal IQ values {player_name} higher than On3 ({diff_pct:+.1f}%) based on performance metrics")
+        else:
+            reasoning_parts.append(f"On3 values {player_name} higher ({-diff_pct:.1f}%) - likely due to social media/brand factors not in our model")
+
+    return {
+        "player_name": player_name,
+        "position": position,
+        "school": school,
+        "on3_value": on3_value,
+        "portal_iq_value": portal_iq_value,
+        "portal_iq_tier": valuation.valuation_tier,
+        "confidence": valuation.confidence,
+        "value_breakdown": value_breakdown,
+        "reasoning": reasoning_parts,
+        "has_on3_data": on3_value is not None,
+    }
 
 
 # =============================================================================

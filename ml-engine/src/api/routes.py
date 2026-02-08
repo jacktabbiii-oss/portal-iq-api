@@ -17,6 +17,7 @@ from ..utils.data_loader import (
     get_portal_players,
     get_database_stats,
     get_player_pff_stats,
+    get_player_dual_valuation,
     _get_nil_tier,
 )
 from ..utils.s3_storage import R2NotConfiguredError, R2DataLoadError
@@ -1684,27 +1685,74 @@ def _calculate_demo_nil_value(player_dict: Dict[str, Any]) -> float:
 
 
 def _get_school_multiplier(school: str) -> float:
-    """Get NIL multiplier based on school brand."""
-    blue_bloods = ["Alabama", "Ohio State", "Georgia", "Texas", "USC", "Michigan", "Notre Dame", "Oklahoma"]
-    elite = ["LSU", "Florida", "Penn State", "Oregon", "Clemson", "Tennessee", "Texas A&M"]
-    power_brand = ["Miami", "Florida State", "Auburn", "Wisconsin", "Iowa", "UCLA"]
+    """Get NIL multiplier based on school brand.
+
+    Uses dynamic CFBD-based tiers when available (wins, SP+, talent, recruiting).
+    Falls back to static list if CFBD data unavailable.
+
+    Updated Feb 2026 to use dynamic school_tiers module.
+    """
+    try:
+        from ..models.school_tiers import get_school_multiplier as dynamic_multiplier
+        return dynamic_multiplier(school.strip())
+    except ImportError:
+        # Fallback to static tiers
+        pass
+
+    # Static fallback (Tier 5: Blue Bloods + Recent Champions)
+    blue_bloods = [
+        "Alabama", "Ohio State", "Georgia", "Texas", "USC", "Michigan",
+        "Notre Dame", "Oklahoma", "Indiana"  # 2025 National Champions!
+    ]
+    elite = [
+        "Oregon", "Penn State", "Clemson", "LSU", "Tennessee", "Texas A&M",
+        "Florida", "Miami", "Colorado"
+    ]
+    power_brand = [
+        "Ole Miss", "Auburn", "Wisconsin", "Iowa", "UCLA", "Florida State",
+        "Arkansas", "Kentucky", "South Carolina", "Missouri", "Kansas", "Utah"
+    ]
 
     school_clean = school.strip()
     if school_clean in blue_bloods:
-        return 2.5
+        return 2.8
     elif school_clean in elite:
-        return 1.8
+        return 2.0
     elif school_clean in power_brand:
-        return 1.4
+        return 1.6
     else:
         return 1.0
 
 
 def _get_school_tier(school: str) -> str:
-    """Get school tier classification."""
-    blue_bloods = ["Alabama", "Ohio State", "Georgia", "Texas", "USC", "Michigan", "Notre Dame", "Oklahoma"]
-    elite = ["LSU", "Florida", "Penn State", "Oregon", "Clemson", "Tennessee", "Texas A&M"]
-    power_brand = ["Miami", "Florida State", "Auburn", "Wisconsin", "Iowa", "UCLA"]
+    """Get school tier classification.
+
+    Uses dynamic CFBD-based tiers when available.
+    Falls back to static list if CFBD data unavailable.
+
+    Updated Feb 2026 to use dynamic school_tiers module.
+    """
+    try:
+        from ..models.school_tiers import get_school_tier as dynamic_tier
+        tier_name, tier_info = dynamic_tier(school.strip())
+        return tier_name
+    except ImportError:
+        # Fallback to static tiers
+        pass
+
+    # Static fallback
+    blue_bloods = [
+        "Alabama", "Ohio State", "Georgia", "Texas", "USC", "Michigan",
+        "Notre Dame", "Oklahoma", "Indiana"  # 2025 National Champions!
+    ]
+    elite = [
+        "Oregon", "Penn State", "Clemson", "LSU", "Tennessee", "Texas A&M",
+        "Florida", "Miami", "Colorado"
+    ]
+    power_brand = [
+        "Ole Miss", "Auburn", "Wisconsin", "Iowa", "UCLA", "Florida State",
+        "Arkansas", "Kentucky", "South Carolina", "Missouri", "Kansas", "Utah"
+    ]
 
     school_clean = school.strip()
     if school_clean in blue_bloods:
@@ -2094,6 +2142,30 @@ async def get_player_stats(
                 "pressures_allowed": pff_stats.get("pressures_allowed"),
                 "sacks_allowed": pff_stats.get("sacks_allowed"),
                 "run_block_percent": pff_stats.get("run_block_percent"),
+            }
+
+        # Add dual valuation (On3 + Portal IQ)
+        dual_val = get_player_dual_valuation(player_name)
+        if dual_val:
+            stats["valuation"] = {
+                "on3_value": dual_val["on3_value"],
+                "portal_iq_value": dual_val["portal_iq_value"],
+                "portal_iq_tier": dual_val["portal_iq_tier"],
+                "confidence": dual_val["confidence"],
+                "has_on3_data": dual_val["has_on3_data"],
+                "breakdown": dual_val["value_breakdown"],
+                "reasoning": dual_val["reasoning"],
+            }
+        else:
+            # Fallback to existing NIL value if dual valuation not available
+            stats["valuation"] = {
+                "on3_value": None,
+                "portal_iq_value": stats.get("nil_value"),
+                "portal_iq_tier": stats.get("nil_tier"),
+                "confidence": "low",
+                "has_on3_data": False,
+                "breakdown": None,
+                "reasoning": ["Limited data available for valuation"],
             }
 
         return APIResponse(status="success", data=stats)
