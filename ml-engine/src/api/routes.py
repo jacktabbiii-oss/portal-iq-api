@@ -1153,6 +1153,240 @@ async def portal_recommendations(
     )
 
 
+@router.get(
+    "/portal/rankings",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Team portal rankings",
+    description="Get teams ranked by portal success based on committed transfers.",
+)
+async def portal_rankings(
+    request: Request,
+    limit: int = 25,
+    api_key: str = Depends(require_api_key),
+):
+    """Get team rankings based on transfer portal success."""
+    try:
+        # Load portal data
+        df = get_portal_players()
+        if df.empty:
+            return APIResponse(
+                status="success",
+                data={"rankings": [], "total_teams": 0}
+            )
+
+        # Only count committed players for rankings
+        status_col = "status" if "status" in df.columns else None
+        if status_col:
+            status_lower = df[status_col].fillna("").str.lower()
+            committed_df = df[status_lower == "committed"]
+        else:
+            committed_df = df
+
+        # Find destination column
+        dest_col = None
+        for col in ["destination_school", "destination", "new_school", "committed_school"]:
+            if col in committed_df.columns:
+                dest_col = col
+                break
+
+        if not dest_col or committed_df.empty:
+            return APIResponse(
+                status="success",
+                data={"rankings": [], "total_teams": 0}
+            )
+
+        # Group by destination school
+        rankings = []
+        grouped = committed_df.groupby(dest_col)
+
+        for team, group in grouped:
+            if pd.isna(team) or str(team).strip() == "":
+                continue
+
+            transfers_in = len(group)
+            total_stars = group["stars"].sum() if "stars" in group.columns else 0
+            avg_stars = group["stars"].mean() if "stars" in group.columns and transfers_in > 0 else 0
+            total_nil = group["nil_value"].sum() if "nil_value" in group.columns else 0
+
+            # Calculate portal score (weighted combination)
+            portal_score = (
+                transfers_in * 10 +
+                total_stars * 5 +
+                (avg_stars * 20) +
+                (total_nil / 50000)
+            )
+
+            # WAR estimate (0.3 per star, 0.5 for 4+ stars)
+            war_added = 0
+            if "stars" in group.columns:
+                for _, player in group.iterrows():
+                    stars = player.get("stars", 0) or 0
+                    if stars >= 4:
+                        war_added += 0.5
+                    elif stars >= 3:
+                        war_added += 0.3
+                    else:
+                        war_added += 0.1
+
+            # Grade based on portal score
+            if portal_score >= 200:
+                grade = "A+"
+            elif portal_score >= 150:
+                grade = "A"
+            elif portal_score >= 100:
+                grade = "B+"
+            elif portal_score >= 75:
+                grade = "B"
+            elif portal_score >= 50:
+                grade = "C+"
+            else:
+                grade = "C"
+
+            # Top acquisitions
+            top_acquisitions = []
+            if "stars" in group.columns:
+                sorted_group = group.sort_values("stars", ascending=False).head(3)
+            else:
+                sorted_group = group.head(3)
+
+            for _, player in sorted_group.iterrows():
+                top_acquisitions.append({
+                    "name": str(player.get("name", "Unknown")),
+                    "position": str(player.get("position", "")),
+                    "stars": int(player.get("stars", 0)) if pd.notna(player.get("stars")) else 0,
+                    "nil_value": float(player.get("nil_value", 0)) if pd.notna(player.get("nil_value")) else 0,
+                })
+
+            rankings.append({
+                "team": str(team),
+                "grade": grade,
+                "portal_score": round(portal_score, 1),
+                "war_added": round(war_added, 2),
+                "total_nil_invested": round(total_nil, 0),
+                "breakdown": {
+                    "transfers_in": transfers_in,
+                    "total_stars": int(total_stars) if pd.notna(total_stars) else 0,
+                    "avg_stars": round(avg_stars, 1) if pd.notna(avg_stars) else 0,
+                },
+                "top_acquisitions": top_acquisitions,
+            })
+
+        # Sort by portal score
+        rankings.sort(key=lambda x: x["portal_score"], reverse=True)
+
+        return APIResponse(
+            status="success",
+            data={
+                "rankings": rankings[:limit],
+                "total_teams": len(rankings),
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Portal rankings error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to calculate rankings: {str(e)}")
+
+
+@router.get(
+    "/portal/team/{team}",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Team portal activity",
+    description="Get incoming and outgoing transfers for a specific team.",
+)
+async def portal_team_activity(
+    request: Request,
+    team: str,
+    season: int = 2026,
+    api_key: str = Depends(require_api_key),
+):
+    """Get incoming and outgoing transfers for a team."""
+    try:
+        df = get_portal_players()
+        if df.empty:
+            return APIResponse(
+                status="success",
+                data={
+                    "team": team,
+                    "season": season,
+                    "incoming": [],
+                    "outgoing": [],
+                    "net_talent_change": 0,
+                }
+            )
+
+        team_lower = team.lower()
+
+        # Find column names
+        origin_col = None
+        dest_col = None
+        for col in ["origin_school", "origin", "from_school", "school"]:
+            if col in df.columns:
+                origin_col = col
+                break
+        for col in ["destination_school", "destination", "new_school", "committed_school"]:
+            if col in df.columns:
+                dest_col = col
+                break
+
+        # Outgoing - players who left this team
+        outgoing = []
+        if origin_col:
+            outgoing_df = df[df[origin_col].fillna("").str.lower() == team_lower]
+            for _, row in outgoing_df.iterrows():
+                outgoing.append({
+                    "player_id": str(row.get("player_id", "")),
+                    "player_name": str(row.get("name", "Unknown")),
+                    "position": str(row.get("position", "")),
+                    "origin_school": str(row.get(origin_col, "")),
+                    "destination_school": str(row.get(dest_col, "")) if dest_col and pd.notna(row.get(dest_col)) else None,
+                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                    "status": str(row.get("status", "available")).lower(),
+                    "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                })
+
+        # Incoming - players who committed to this team
+        incoming = []
+        if dest_col:
+            incoming_df = df[df[dest_col].fillna("").str.lower() == team_lower]
+            for _, row in incoming_df.iterrows():
+                incoming.append({
+                    "player_id": str(row.get("player_id", "")),
+                    "player_name": str(row.get("name", "Unknown")),
+                    "position": str(row.get("position", "")),
+                    "origin_school": str(row.get(origin_col, "")) if origin_col else "",
+                    "destination_school": str(row.get(dest_col, "")),
+                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                    "status": "committed",
+                    "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                })
+
+        # Calculate net talent change (incoming stars - outgoing stars)
+        incoming_stars = sum(p.get("stars", 0) or 0 for p in incoming)
+        outgoing_stars = sum(p.get("stars", 0) or 0 for p in outgoing)
+        net_talent_change = incoming_stars - outgoing_stars
+
+        return APIResponse(
+            status="success",
+            data={
+                "team": team,
+                "season": season,
+                "incoming": incoming,
+                "outgoing": outgoing,
+                "net_talent_change": net_talent_change,
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Team portal activity error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to get team activity: {str(e)}")
+
+
 # =============================================================================
 # Draft Endpoints
 # =============================================================================
