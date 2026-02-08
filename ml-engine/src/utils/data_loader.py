@@ -264,6 +264,175 @@ def _get_nil_tier(value: float) -> str:
 
 
 # =============================================================================
+# PFF Stats Functions
+# =============================================================================
+
+_pff_cache: Optional[pd.DataFrame] = None
+
+
+def get_pff_grades() -> pd.DataFrame:
+    """Load PFF player grades from R2.
+
+    Returns:
+        DataFrame with all PFF grades and stats
+    """
+    global _pff_cache
+
+    if _pff_cache is not None:
+        return _pff_cache
+
+    df = _load_csv("pff_player_grades.csv")
+    if not df.empty:
+        _pff_cache = df
+        logger.info(f"Loaded {len(df)} PFF records")
+    return df
+
+
+def get_player_pff_stats(player_name: str, season: int = 2025) -> Optional[Dict[str, Any]]:
+    """Get detailed PFF stats for a specific player.
+
+    Args:
+        player_name: Player name to search for
+        season: Season year (default 2025)
+
+    Returns:
+        Dict with PFF stats or None if not found
+    """
+    df = get_pff_grades()
+    if df.empty:
+        return None
+
+    player_name_lower = player_name.lower()
+
+    # Filter by season if column exists
+    if "season" in df.columns:
+        season_df = df[df["season"] == season]
+        if season_df.empty:
+            season_df = df  # Fall back to all seasons
+    else:
+        season_df = df
+
+    # Try exact match first
+    mask = season_df["name"].str.lower() == player_name_lower
+    matches = season_df[mask]
+
+    # Try contains match if no exact match
+    if matches.empty:
+        mask = season_df["name"].str.lower().str.contains(player_name_lower, na=False)
+        matches = season_df[mask]
+
+    if matches.empty:
+        return None
+
+    # Get the most recent / highest graded record
+    if "pff_overall" in matches.columns:
+        row = matches.sort_values("pff_overall", ascending=False).iloc[0]
+    else:
+        row = matches.iloc[0]
+
+    def safe_float(val):
+        """Convert value to float, return None if invalid."""
+        if pd.isna(val) or val == "" or val == 0:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    # Build comprehensive stats dict
+    stats = {
+        # Basic info
+        "name": str(row.get("name", player_name)),
+        "position": str(row.get("position", "")),
+        "team": str(row.get("team", "")),
+        "season": int(row.get("season", season)) if pd.notna(row.get("season")) else season,
+        "games_played": int(row.get("games_played", 0)) if pd.notna(row.get("games_played")) else None,
+
+        # Core PFF grades
+        "pff_overall": safe_float(row.get("pff_overall")),
+        "pff_offense": safe_float(row.get("pff_offense")),
+        "pff_defense": safe_float(row.get("pff_defense")),
+        "pff_passing": safe_float(row.get("pff_passing")),
+        "pff_rushing": safe_float(row.get("pff_rushing")),
+        "pff_receiving": safe_float(row.get("pff_receiving")),
+        "pff_pass_block": safe_float(row.get("pff_pass_block")),
+        "pff_run_block": safe_float(row.get("pff_run_block")),
+        "pff_pass_rush": safe_float(row.get("pff_pass_rush")),
+        "pff_coverage": safe_float(row.get("pff_coverage")),
+        "pff_run_defense": safe_float(row.get("pff_run_defense")),
+        "pff_tackling": safe_float(row.get("pff_tackling")),
+
+        # QB stats
+        "passer_rating": safe_float(row.get("passer_rating")),
+        "completion_pct": safe_float(row.get("completion_pct")),
+        "big_time_throws": safe_float(row.get("big_time_throws")),
+        "big_time_throw_pct": safe_float(row.get("big_time_throw_pct")),
+        "turnover_worthy_plays": safe_float(row.get("turnover_worthy_plays")),
+        "turnover_worthy_play_pct": safe_float(row.get("turnover_worthy_play_pct")),
+        "avg_time_to_throw": safe_float(row.get("avg_time_to_throw")),
+        "pressure_to_sack_rate": safe_float(row.get("pressure_to_sack_rate")),
+        "pressure_completion_pct": safe_float(row.get("pressure_completion_percent")),
+        "pressure_qb_rating": safe_float(row.get("pressure_qb_rating")),
+
+        # RB stats
+        "elusive_rating": safe_float(row.get("elusive_rating")),
+        "yards_after_contact": safe_float(row.get("yards_after_contact")),
+        "yaco_per_attempt": safe_float(row.get("yaco_per_attempt")),
+        "breakaway_pct": safe_float(row.get("breakaway_pct")),
+        "missed_tackles_forced": safe_float(row.get("missed_tackles_forced")),
+        "yards": safe_float(row.get("yards")),
+        "touchdowns": safe_float(row.get("touchdowns")),
+        "yards_per_carry": safe_float(row.get("ypa")),
+
+        # WR/TE stats
+        "yards_per_route_run": safe_float(row.get("yards_per_route_run")),
+        "drop_rate": safe_float(row.get("drop_rate")),
+        "contested_catch_rate": safe_float(row.get("contested_catch_rate")),
+        "yards_after_catch": safe_float(row.get("yards_after_catch")),
+        "yards_after_catch_per_reception": safe_float(row.get("yards_after_catch_per_reception")),
+        "targets": safe_float(row.get("targets")),
+        "receptions": safe_float(row.get("receptions")),
+        "rec_yards": safe_float(row.get("rec_yards")),
+        "routes_run": safe_float(row.get("routes_run")),
+        "avg_depth_of_target": safe_float(row.get("avg_depth_of_target")),
+        "caught_percent": safe_float(row.get("caught_percent")),
+
+        # Pass rush stats
+        "pass_rushing_productivity": safe_float(row.get("pass_rushing_productivity")),
+        "pass_rush_win_rate": safe_float(row.get("pass_rush_win_rate")),
+        "pressures": safe_float(row.get("pressures")),
+        "sacks": safe_float(row.get("sacks")),
+        "hurries": safe_float(row.get("hurries")),
+        "hits": safe_float(row.get("hits")),
+
+        # Coverage stats
+        "passer_rating_allowed": safe_float(row.get("passer_rating_allowed")),
+        "yards_per_coverage_snap": safe_float(row.get("yards_per_coverage_snap")),
+        "forced_incompletes": safe_float(row.get("forced_incompletes")),
+        "forced_incompletion_rate": safe_float(row.get("forced_incompletion_rate")),
+        "interceptions": safe_float(row.get("ints")),
+        "pass_breakups": safe_float(row.get("pbus")),
+        "missed_tackle_rate": safe_float(row.get("missed_tackle_rate")),
+
+        # Blocking stats
+        "pass_blocking_efficiency": safe_float(row.get("pass_blocking_efficiency")),
+        "pressures_allowed": safe_float(row.get("pressures_allowed")),
+        "sacks_allowed": safe_float(row.get("sacks_allowed")),
+        "hurries_allowed": safe_float(row.get("hurries_allowed")),
+        "run_block_percent": safe_float(row.get("run_block_percent")),
+
+        # Tackling stats
+        "tackles": safe_float(row.get("tackles")),
+        "assists": safe_float(row.get("assists")),
+        "stops": safe_float(row.get("stops")),
+        "tackles_for_loss": safe_float(row.get("tackles_for_loss")),
+        "missed_tackles": safe_float(row.get("missed_tackles")),
+    }
+
+    return stats
+
+
+# =============================================================================
 # Transfer Portal Functions
 # =============================================================================
 
