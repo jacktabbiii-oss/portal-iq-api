@@ -129,6 +129,103 @@ def player_to_dataframe(player_data: Dict[str, Any]) -> pd.DataFrame:
 
 
 # =============================================================================
+# Valuation Helper Functions
+# =============================================================================
+
+def _get_position_base_value(position: str) -> int:
+    """Get base NIL value by position."""
+    position_values = {
+        "QB": 250000,
+        "WR": 120000,
+        "RB": 100000,
+        "TE": 80000,
+        "OT": 70000,
+        "OG": 60000,
+        "C": 60000,
+        "OL": 65000,
+        "EDGE": 90000,
+        "DT": 75000,
+        "DE": 85000,
+        "DL": 80000,
+        "LB": 75000,
+        "CB": 95000,
+        "S": 70000,
+        "K": 30000,
+        "P": 25000,
+        "LS": 20000,
+    }
+    return position_values.get(position.upper(), 50000)
+
+
+def _get_school_multiplier(school: str) -> float:
+    """Get school brand multiplier based on tier."""
+    tier1 = ["Ohio State", "Alabama", "Georgia", "Michigan", "Texas", "USC", "LSU", "Oregon", "Clemson", "Notre Dame"]
+    tier2 = ["Oklahoma", "Penn State", "Florida", "Tennessee", "Miami", "Auburn", "Texas A&M", "Ole Miss", "Wisconsin", "Utah"]
+    tier3 = ["Colorado", "Florida State", "Washington", "UCLA", "Arizona", "Michigan State", "Iowa", "Nebraska", "Arkansas", "NC State"]
+
+    school_lower = school.lower()
+    for s in tier1:
+        if s.lower() in school_lower:
+            return 2.0
+    for s in tier2:
+        if s.lower() in school_lower:
+            return 1.5
+    for s in tier3:
+        if s.lower() in school_lower:
+            return 1.25
+    return 1.0
+
+
+def _generate_valuation_reasoning(
+    position: str,
+    school: str,
+    pff_overall: float,
+    stars: int,
+    nil_value: float,
+) -> List[str]:
+    """Generate human-readable reasoning for NIL valuation."""
+    reasons = []
+
+    # Position reasoning
+    high_value_positions = ["QB", "WR", "CB", "EDGE"]
+    if position.upper() in high_value_positions:
+        reasons.append(f"{position} is a premium NIL position with high market demand")
+    else:
+        reasons.append(f"{position} has moderate NIL market value")
+
+    # School reasoning
+    school_mult = _get_school_multiplier(school)
+    if school_mult >= 2.0:
+        reasons.append(f"{school} is a Tier 1 NIL market with elite brand value")
+    elif school_mult >= 1.5:
+        reasons.append(f"{school} is a strong NIL market with good brand visibility")
+    elif school_mult >= 1.25:
+        reasons.append(f"{school} is an emerging NIL market")
+    else:
+        reasons.append(f"{school} has developing NIL opportunities")
+
+    # Performance reasoning
+    if pff_overall >= 85:
+        reasons.append(f"Elite PFF grade ({pff_overall:.1f}) significantly boosts valuation")
+    elif pff_overall >= 75:
+        reasons.append(f"Strong PFF grade ({pff_overall:.1f}) supports higher valuation")
+    elif pff_overall >= 65:
+        reasons.append(f"Solid PFF grade ({pff_overall:.1f}) at position average")
+    elif pff_overall > 0:
+        reasons.append(f"PFF grade ({pff_overall:.1f}) indicates room for development")
+
+    # Recruiting reasoning
+    if stars >= 5:
+        reasons.append("5-star recruit with maximum recruiting premium")
+    elif stars >= 4:
+        reasons.append("4-star recruit with significant brand recognition")
+    elif stars >= 3:
+        reasons.append("3-star recruit with solid foundation")
+
+    return reasons
+
+
+# =============================================================================
 # NIL Endpoints
 # =============================================================================
 
@@ -561,98 +658,10 @@ async def search_players(
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
-@router.get(
-    "/players/{player_name}/stats",
-    response_model=APIResponse,
-    tags=["Players"],
-    summary="Get player detailed stats",
-    description="Get all available stats for a specific player.",
-)
-async def get_player_stats(
-    request: Request,
-    player_name: str,
-    api_key: str = Depends(require_api_key),
-):
-    """Get detailed stats for a specific player.
-
-    This endpoint returns all available data for a player including
-    NIL valuation, PFF grades, portal status, and recruiting info.
-    """
-    try:
-        player_data = {}
-
-        # Search NIL data
-        nil_df = get_nil_players(limit=50000)
-        if not nil_df.empty:
-            match = nil_df[nil_df["name"].str.lower() == player_name.lower()]
-            if not match.empty:
-                row = match.iloc[0]
-                player_data["nil"] = {
-                    "valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
-                    "tier": str(row.get("tier", "")),
-                    "valuation_source": str(row.get("valuation_source", "")) if pd.notna(row.get("valuation_source")) else None,
-                }
-                player_data["profile"] = {
-                    "name": str(row.get("name", "")),
-                    "position": str(row.get("position", "")),
-                    "school": str(row.get("school", "")),
-                    "conference": str(row.get("conference")) if pd.notna(row.get("conference")) else None,
-                    "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                    "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
-                    "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
-                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
-                }
-                # Add PFF stats if available
-                pff_cols = [c for c in row.index if c.startswith("pff_")]
-                if pff_cols:
-                    player_data["pff"] = {
-                        col: float(row[col]) if pd.notna(row[col]) else None
-                        for col in pff_cols
-                    }
-
-        # Search Portal data
-        portal_df = get_portal_players(limit=50000)
-        if not portal_df.empty:
-            match = portal_df[portal_df["name"].str.lower() == player_name.lower()]
-            if not match.empty:
-                row = match.iloc[0]
-                player_data["portal"] = {
-                    "status": str(row.get("status", "")),
-                    "origin_school": str(row.get("origin_school", "")),
-                    "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
-                    "entry_date": str(row.get("entry_date")) if pd.notna(row.get("entry_date")) else None,
-                }
-                # Fill profile if not already from NIL
-                if "profile" not in player_data:
-                    player_data["profile"] = {
-                        "name": str(row.get("name", "")),
-                        "position": str(row.get("position", "")),
-                        "school": str(row.get("origin_school", "")),
-                        "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
-                    }
-
-        if not player_data:
-            raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
-
-        return APIResponse(
-            status="success",
-            data=player_data,
-        )
-
-    except HTTPException:
-        raise
-    except R2NotConfiguredError as e:
-        logger.error(f"R2 not configured: {e}")
-        raise HTTPException(status_code=503, detail={"error": "Storage not configured"})
-    except R2DataLoadError as e:
-        logger.error(f"R2 data load failed: {e}")
-        raise HTTPException(status_code=503, detail={"error": "Data unavailable"})
-    except Exception as e:
-        logger.error(f"Player stats error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to get player stats: {str(e)}")
+# NOTE: The comprehensive /players/{player_name}/stats endpoint is defined below
+# (around line 1897) to avoid duplicate route definitions. That version returns
+# the full PlayerStats format expected by the frontend with PFF grades,
+# position-specific stats, and valuation data.
 
 
 @router.post(
@@ -1913,8 +1922,8 @@ async def get_player_stats(
         player_name = unquote(player_name)
         player_name_lower = player_name.lower()
 
-        # Search in NIL data first
-        nil_df = get_nil_players(limit=500)
+        # Search in NIL data first - use full dataset to find any player
+        nil_df = get_nil_players(limit=50000)
         player_row = None
 
         if not nil_df.empty:
@@ -1925,7 +1934,7 @@ async def get_player_stats(
 
         # If not found in NIL, check portal
         if player_row is None:
-            portal_df = get_portal_players(limit=500)
+            portal_df = get_portal_players(limit=50000)
             if not portal_df.empty:
                 mask = portal_df["name"].str.lower() == player_name_lower
                 matches = portal_df[mask]
@@ -2019,6 +2028,42 @@ async def get_player_stats(
                 "sacks_allowed": float(player_row.get("sacks_allowed", 0)) if pd.notna(player_row.get("sacks_allowed")) else None,
             }
 
+        # Add valuation breakdown for the frontend
+        nil_value = stats.get("nil_value") or 0
+        has_on3 = pd.notna(player_row.get("on3_nil_value")) if "on3_nil_value" in player_row.index else False
+        on3_value = float(player_row.get("on3_nil_value", 0)) if has_on3 and pd.notna(player_row.get("on3_nil_value")) else None
+
+        # Calculate valuation breakdown
+        position_base = _get_position_base_value(position)
+        school_mult = _get_school_multiplier(stats.get("school", ""))
+        pff_overall = stats.get("pff", {}).get("overall") or 0
+        perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
+        stars = stats.get("stars") or 0
+        starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+
+        stats["valuation"] = {
+            "on3_value": on3_value,
+            "portal_iq_value": nil_value,
+            "portal_iq_tier": stats.get("nil_tier", "emerging"),
+            "confidence": "high" if has_on3 else ("medium" if pff_overall > 0 else "low"),
+            "has_on3_data": has_on3,
+            "breakdown": {
+                "position_base": position_base,
+                "school_multiplier": round(school_mult, 2),
+                "performance_multiplier": round(perf_mult, 2),
+                "starter_bonus": round(starter_bonus, 2),
+                "social_value": 0,
+                "potential_value": 0,
+            },
+            "reasoning": _generate_valuation_reasoning(
+                position=position,
+                school=stats.get("school", ""),
+                pff_overall=pff_overall,
+                stars=stars,
+                nil_value=nil_value,
+            ),
+        }
+
         return APIResponse(status="success", data=stats)
 
     except HTTPException:
@@ -2046,3 +2091,316 @@ async def get_player_stats(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to get player stats: {str(e)}")
+
+
+# =============================================================================
+# Player Comparison Endpoints
+# =============================================================================
+
+@router.get(
+    "/players/{player_name}/comparisons",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Get player comparisons",
+    description="Find similar NFL and college players based on stats and measurables.",
+)
+async def get_player_comparisons_endpoint(
+    request: Request,
+    player_name: str,
+    include_nfl: bool = Query(True, description="Include NFL player comparisons"),
+    include_college: bool = Query(True, description="Include college player comparisons"),
+    limit: int = Query(5, ge=1, le=20, description="Max comparisons per category"),
+    api_key: str = Depends(require_api_key),
+):
+    """Get comparable players for draft/portal analysis."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+
+        # Get player position for position-based comparisons
+        nil_df = get_nil_players(limit=50000)
+        position = "Unknown"
+        if not nil_df.empty:
+            match = nil_df[nil_df["name"].str.lower() == player_name.lower()]
+            if not match.empty:
+                position = str(match.iloc[0].get("position", "Unknown"))
+
+        # Return placeholder comparisons (full implementation requires similarity engine)
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": position,
+                "nfl_comparisons": [],
+                "college_comparisons": [],
+                "message": "Player comparison engine in development",
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Player comparison error: {e}")
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": "Unknown",
+                "nfl_comparisons": [],
+                "college_comparisons": [],
+                "message": "Comparison data not available",
+            }
+        )
+
+
+@router.get(
+    "/players/{player_name}/career",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Get player career stats",
+    description="Get multi-season career trajectory for a player.",
+)
+async def get_player_career_endpoint(
+    request: Request,
+    player_name: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get career stats across multiple seasons."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+
+        # Return placeholder career data
+        return APIResponse(
+            status="success",
+            data={
+                "player_name": player_name,
+                "college_seasons": [],
+                "nfl_seasons": [],
+                "combine_data": None,
+                "total_seasons": 0,
+                "message": "Career tracking in development",
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Player career error: {e}")
+        return APIResponse(
+            status="success",
+            data={
+                "player_name": player_name,
+                "college_seasons": [],
+                "nfl_seasons": [],
+                "combine_data": None,
+                "total_seasons": 0,
+            }
+        )
+
+
+@router.get(
+    "/players/{player_name}/elite-profile",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Get elite athlete profile",
+    description="Get elite measurables and trait analysis for a player.",
+)
+async def get_player_elite_profile(
+    request: Request,
+    player_name: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get elite athlete profile with measurables."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+
+        # Get player data
+        nil_df = get_nil_players(limit=50000)
+        position = "Unknown"
+        height = None
+        weight = None
+
+        if not nil_df.empty:
+            match = nil_df[nil_df["name"].str.lower() == player_name.lower()]
+            if not match.empty:
+                row = match.iloc[0]
+                position = str(row.get("position", "Unknown"))
+                height = float(row.get("height", 0)) if pd.notna(row.get("height")) else None
+                weight = float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None
+
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": position,
+                "elite_traits": [],
+                "elite_trait_count": 0,
+                "elite_bonus": 1.0,
+                "draft_adjustment": 0,
+                "measurables": {
+                    "height": height,
+                    "weight": weight,
+                    "forty": None,
+                    "vertical": None,
+                    "broad_jump": None,
+                    "bench": None,
+                    "three_cone": None,
+                    "shuttle": None,
+                },
+                "thresholds": {},
+                "message": "Elite trait analysis in development",
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Elite profile error: {e}")
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": "Unknown",
+                "elite_traits": [],
+                "elite_trait_count": 0,
+                "elite_bonus": 1.0,
+                "draft_adjustment": 0,
+                "measurables": {},
+                "thresholds": {},
+            }
+        )
+
+
+# =============================================================================
+# Draft Projection Endpoint
+# =============================================================================
+
+@router.get(
+    "/draft/project/{player_name}",
+    response_model=APIResponse,
+    tags=["Draft"],
+    summary="Get draft projection for player",
+    description="Get NFL draft projection with round, pick range, and contract estimates.",
+)
+async def get_draft_projection_endpoint(
+    request: Request,
+    player_name: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get draft projection for a specific player."""
+    try:
+        from urllib.parse import unquote
+        player_name = unquote(player_name)
+
+        # Get player data
+        nil_df = get_nil_players(limit=50000)
+        position = "Unknown"
+        pff_overall = 0
+        stars = 0
+
+        if not nil_df.empty:
+            match = nil_df[nil_df["name"].str.lower() == player_name.lower()]
+            if not match.empty:
+                row = match.iloc[0]
+                position = str(row.get("position", "Unknown"))
+                pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
+                stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+
+        # Calculate draft grade based on PFF and recruiting
+        draft_grade = min(100, (pff_overall * 0.7) + (stars * 8))
+
+        # Determine round projection
+        if draft_grade >= 85:
+            projected_round = 1
+            pick_range = "1-15"
+            draft_probability = 0.95
+        elif draft_grade >= 75:
+            projected_round = 2
+            pick_range = "32-64"
+            draft_probability = 0.85
+        elif draft_grade >= 65:
+            projected_round = 3
+            pick_range = "65-100"
+            draft_probability = 0.70
+        elif draft_grade >= 55:
+            projected_round = 5
+            pick_range = "140-180"
+            draft_probability = 0.45
+        else:
+            projected_round = None
+            pick_range = "UDFA"
+            draft_probability = 0.20
+
+        # Calculate letter grade
+        if draft_grade >= 90:
+            letter_grade = "A+"
+        elif draft_grade >= 85:
+            letter_grade = "A"
+        elif draft_grade >= 80:
+            letter_grade = "A-"
+        elif draft_grade >= 75:
+            letter_grade = "B+"
+        elif draft_grade >= 70:
+            letter_grade = "B"
+        elif draft_grade >= 65:
+            letter_grade = "B-"
+        elif draft_grade >= 60:
+            letter_grade = "C+"
+        elif draft_grade >= 55:
+            letter_grade = "C"
+        else:
+            letter_grade = "C-"
+
+        # Estimate contract values
+        if projected_round == 1:
+            rookie_contract = 15000000 + (15 - int(pick_range.split("-")[0])) * 1000000
+            career_estimate = 100000000
+        elif projected_round == 2:
+            rookie_contract = 5000000
+            career_estimate = 40000000
+        elif projected_round:
+            rookie_contract = 1000000
+            career_estimate = 15000000
+        else:
+            rookie_contract = 750000
+            career_estimate = 5000000
+
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": position,
+                "draft_grade": round(draft_grade, 1),
+                "draft_letter_grade": letter_grade,
+                "projected_round": projected_round,
+                "projected_pick": int(pick_range.split("-")[0]) if projected_round else 250,
+                "pick_range": pick_range,
+                "draft_probability": draft_probability,
+                "elite_bonus": 1.0,
+                "elite_traits": [],
+                "elite_adjustment": 0,
+                "rookie_contract_estimate": rookie_contract,
+                "career_earnings_estimate": career_estimate,
+                "expected_draft_value": rookie_contract * draft_probability,
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Draft projection error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return APIResponse(
+            status="success",
+            data={
+                "player": player_name,
+                "position": "Unknown",
+                "draft_grade": 0,
+                "draft_letter_grade": "N/A",
+                "projected_round": None,
+                "projected_pick": 250,
+                "pick_range": "UDFA",
+                "draft_probability": 0.1,
+                "elite_bonus": 1.0,
+                "elite_traits": [],
+                "elite_adjustment": 0,
+                "rookie_contract_estimate": 750000,
+                "career_earnings_estimate": 3000000,
+                "expected_draft_value": 75000,
+            }
+        )

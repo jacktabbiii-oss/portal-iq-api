@@ -247,14 +247,16 @@ Simply make HTTP calls with JSON payloads.
 # =============================================================================
 
 if IS_PRODUCTION:
-    # Restrict origins in production
+    # Restrict origins in production - include Vercel deployments
     allowed_origins = [
         origin.strip()
         for origin in os.getenv(
             "ALLOWED_ORIGINS",
-            "https://playmakervc.com,https://app.playmakervc.com,https://portaliq.app"
+            "https://playmakervc.com,https://app.playmakervc.com,https://portaliq.app,https://portal-iq.vercel.app,https://portal-iq-web.vercel.app"
         ).split(",")
     ]
+    # Also allow any Vercel preview deployments
+    allowed_origins.append("https://*.vercel.app")
     logger.info(f"CORS: Production mode - allowed origins: {allowed_origins}")
 else:
     # Allow all origins in development
