@@ -516,6 +516,7 @@ async def nil_leaderboard(
                 "school": school_name,
                 "conference": str(row.get("conference", "")) if pd.notna(row.get("conference")) else None,
                 "valuation": val["value"],
+                "performance_value": val["performance_value"],
                 "on3_value": on3_value if on3_value > 0 else None,
                 "nil_tier": val["tier"],
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
@@ -2561,3 +2562,364 @@ async def get_draft_projection_endpoint(
                 "expected_draft_value": 75000,
             }
         )
+
+
+# =============================================================================
+# TEAM PORTAL ENDPOINTS (Real Data)
+# =============================================================================
+
+
+@router.get(
+    "/portal/team/{team}",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Team Portal Activity",
+    description="Get incoming and outgoing transfer portal activity for a specific team.",
+)
+async def team_portal_activity(
+    request: Request,
+    team: str,
+    season: int = Query(2025, description="Season year"),
+    api_key: str = Depends(require_api_key),
+):
+    """Get portal activity for a team - who's coming in and going out."""
+    try:
+        portal_df = get_portal_players(limit=50000)
+
+        if portal_df.empty:
+            return APIResponse(
+                status="success",
+                data={
+                    "team": team, "season": season,
+                    "incoming": [], "outgoing": [],
+                    "net_war": 0, "total_nil_invested": 0,
+                    "summary": {
+                        "incoming_count": 0, "outgoing_count": 0, "net_count": 0,
+                        "incoming_war": 0, "outgoing_war": 0,
+                    },
+                },
+            )
+
+        team_lower = team.lower()
+
+        # Incoming: players whose destination matches this team
+        dest_col = "destination_school" if "destination_school" in portal_df.columns else "dest_school"
+        origin_col = "origin_school" if "origin_school" in portal_df.columns else "school"
+
+        incoming_mask = portal_df[dest_col].str.lower().str.contains(team_lower, na=False)
+        outgoing_mask = portal_df[origin_col].str.lower().str.contains(team_lower, na=False)
+
+        incoming_df = portal_df[incoming_mask]
+        outgoing_df = portal_df[outgoing_mask]
+
+        def _build_player_list(df, direction):
+            players = []
+            for _, row in df.iterrows():
+                name = str(row.get("name", row.get("player_name", "Unknown")))
+                pos = str(row.get("position", "")).upper()
+                stars_val = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+                origin = str(row.get(origin_col, "")) if pd.notna(row.get(origin_col)) else ""
+                dest = str(row.get(dest_col, "")) if pd.notna(row.get(dest_col)) else ""
+                status = str(row.get("status", "unknown")).lower()
+
+                # Calculate Portal IQ valuation
+                school_for_val = dest if direction == "incoming" else origin
+                val = calculate_portal_iq_value(pos, school_for_val, 0, stars_val)
+
+                # Simple WAR estimate based on stars and position
+                war_estimates = {"QB": 2.5, "WR": 1.5, "RB": 1.2, "CB": 1.5, "EDGE": 1.8, "DE": 1.8}
+                base_war = war_estimates.get(pos, 1.0)
+                star_war_mult = {5: 2.0, 4: 1.5, 3: 1.0, 2: 0.6}.get(stars_val, 0.4)
+                war = round(base_war * star_war_mult, 2)
+
+                players.append({
+                    "player_name": name,
+                    "position": pos,
+                    "origin_school": origin,
+                    "destination_school": dest,
+                    "stars": stars_val,
+                    "nil_valuation": val["value"],
+                    "war": war,
+                    "status": status,
+                })
+            return players
+
+        incoming_list = _build_player_list(incoming_df, "incoming")
+        outgoing_list = _build_player_list(outgoing_df, "outgoing")
+
+        incoming_war = sum(p["war"] for p in incoming_list)
+        outgoing_war = sum(p["war"] for p in outgoing_list)
+        total_nil = sum(p["nil_valuation"] for p in incoming_list)
+
+        return APIResponse(
+            status="success",
+            data={
+                "team": team,
+                "season": season,
+                "incoming": incoming_list,
+                "outgoing": outgoing_list,
+                "net_war": round(incoming_war - outgoing_war, 2),
+                "total_nil_invested": total_nil,
+                "summary": {
+                    "incoming_count": len(incoming_list),
+                    "outgoing_count": len(outgoing_list),
+                    "net_count": len(incoming_list) - len(outgoing_list),
+                    "incoming_war": round(incoming_war, 2),
+                    "outgoing_war": round(outgoing_war, 2),
+                },
+            },
+        )
+
+    except (R2NotConfiguredError, R2DataLoadError) as e:
+        logger.error(f"Data error for team portal: {e}")
+        raise HTTPException(status_code=503, detail="Data unavailable")
+    except Exception as e:
+        logger.error(f"Team portal error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/portal/rankings",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Portal Team Rankings",
+    description="Rank teams by transfer portal performance.",
+)
+async def portal_team_rankings(
+    request: Request,
+    limit: int = Query(25, ge=1, le=200),
+    api_key: str = Depends(require_api_key),
+):
+    """Rank all teams by portal class strength."""
+    try:
+        portal_df = get_portal_players(limit=50000)
+
+        if portal_df.empty:
+            return APIResponse(
+                status="success",
+                data={"rankings": [], "total_teams": 0},
+            )
+
+        dest_col = "destination_school" if "destination_school" in portal_df.columns else "dest_school"
+
+        # Only count committed players (incoming)
+        committed = portal_df[portal_df["status"].str.lower().str.contains("committed", na=False)] if "status" in portal_df.columns else portal_df
+
+        # Group by destination school
+        team_stats = {}
+        for _, row in committed.iterrows():
+            dest = str(row.get(dest_col, "")) if pd.notna(row.get(dest_col)) else ""
+            if not dest or dest == "" or dest == "nan":
+                continue
+
+            if dest not in team_stats:
+                team_stats[dest] = {
+                    "team": dest,
+                    "transfers_in": 0,
+                    "total_stars": 0,
+                    "total_nil": 0,
+                    "total_war": 0,
+                    "top_acquisitions": [],
+                }
+
+            stars_val = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+            pos = str(row.get("position", "")).upper()
+            name = str(row.get("name", row.get("player_name", "Unknown")))
+
+            val = calculate_portal_iq_value(pos, dest, 0, stars_val)
+
+            war_estimates = {"QB": 2.5, "WR": 1.5, "RB": 1.2, "CB": 1.5, "EDGE": 1.8, "DE": 1.8}
+            base_war = war_estimates.get(pos, 1.0)
+            star_war_mult = {5: 2.0, 4: 1.5, 3: 1.0, 2: 0.6}.get(stars_val, 0.4)
+            war = round(base_war * star_war_mult, 2)
+
+            team_stats[dest]["transfers_in"] += 1
+            team_stats[dest]["total_stars"] += stars_val
+            team_stats[dest]["total_nil"] += val["value"]
+            team_stats[dest]["total_war"] += war
+            team_stats[dest]["top_acquisitions"].append({
+                "name": name,
+                "position": pos,
+                "stars": stars_val,
+                "nil_value": val["value"],
+            })
+
+        # Build rankings
+        rankings = []
+        for team_name, stats in team_stats.items():
+            count = stats["transfers_in"]
+            if count == 0:
+                continue
+
+            avg_stars = round(stats["total_stars"] / count, 1) if count > 0 else 0
+            war_added = round(stats["total_war"], 2)
+
+            # Portal score: combination of WAR added and quality
+            portal_score = round(war_added * 10 + avg_stars * 5 + count * 2, 1)
+
+            # Grade based on portal score
+            if portal_score >= 80:
+                grade = "A+"
+            elif portal_score >= 65:
+                grade = "A"
+            elif portal_score >= 50:
+                grade = "B+"
+            elif portal_score >= 40:
+                grade = "B"
+            elif portal_score >= 30:
+                grade = "C+"
+            elif portal_score >= 20:
+                grade = "C"
+            else:
+                grade = "D"
+
+            # Sort top acquisitions by NIL value, take top 3
+            top_acq = sorted(stats["top_acquisitions"], key=lambda x: x["nil_value"], reverse=True)[:3]
+
+            rankings.append({
+                "team": team_name,
+                "grade": grade,
+                "portal_score": portal_score,
+                "war_added": war_added,
+                "total_nil_invested": stats["total_nil"],
+                "breakdown": {
+                    "transfers_in": count,
+                    "total_stars": stats["total_stars"],
+                    "avg_stars": avg_stars,
+                },
+                "top_acquisitions": top_acq,
+            })
+
+        # Sort by portal score descending
+        rankings.sort(key=lambda r: r["portal_score"], reverse=True)
+
+        return APIResponse(
+            status="success",
+            data={
+                "rankings": rankings[:limit],
+                "total_teams": len(rankings),
+            },
+        )
+
+    except (R2NotConfiguredError, R2DataLoadError) as e:
+        logger.error(f"Data error for portal rankings: {e}")
+        raise HTTPException(status_code=503, detail="Data unavailable")
+    except Exception as e:
+        logger.error(f"Portal rankings error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/roster/{team}/needs",
+    response_model=APIResponse,
+    tags=["Roster"],
+    summary="Team Roster Needs",
+    description="Analyze position needs based on portal ins/outs.",
+)
+async def roster_needs(
+    request: Request,
+    team: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Position needs analysis based on incoming/outgoing portal players."""
+    try:
+        portal_df = get_portal_players(limit=50000)
+
+        all_positions = ["QB", "RB", "WR", "TE", "OT", "OG", "C", "OL", "DT", "DE", "EDGE", "DL", "LB", "CB", "S", "K", "P"]
+
+        if portal_df.empty:
+            needs = {pos: {"incoming": 0, "outgoing": 0, "net": 0, "need_level": "moderate"} for pos in all_positions}
+            return APIResponse(
+                status="success",
+                data={
+                    "team": team,
+                    "needs": needs,
+                    "priority_positions": all_positions[:5],
+                    "analysis": "No portal data available for analysis.",
+                },
+            )
+
+        team_lower = team.lower()
+        dest_col = "destination_school" if "destination_school" in portal_df.columns else "dest_school"
+        origin_col = "origin_school" if "origin_school" in portal_df.columns else "school"
+
+        incoming_mask = portal_df[dest_col].str.lower().str.contains(team_lower, na=False)
+        outgoing_mask = portal_df[origin_col].str.lower().str.contains(team_lower, na=False)
+
+        incoming_df = portal_df[incoming_mask]
+        outgoing_df = portal_df[outgoing_mask]
+
+        # Count by position
+        pos_incoming = {}
+        for _, row in incoming_df.iterrows():
+            pos = str(row.get("position", "")).upper()
+            pos_incoming[pos] = pos_incoming.get(pos, 0) + 1
+
+        pos_outgoing = {}
+        for _, row in outgoing_df.iterrows():
+            pos = str(row.get("position", "")).upper()
+            pos_outgoing[pos] = pos_outgoing.get(pos, 0) + 1
+
+        # Build needs analysis
+        seen_positions = set(list(pos_incoming.keys()) + list(pos_outgoing.keys()))
+        needs = {}
+        priority_positions = []
+
+        for pos in seen_positions:
+            inc = pos_incoming.get(pos, 0)
+            out = pos_outgoing.get(pos, 0)
+            net = inc - out
+
+            if net <= -2:
+                need_level = "critical"
+            elif net <= -1:
+                need_level = "moderate"
+            elif net == 0 and out > 0:
+                need_level = "low"
+            else:
+                need_level = "none"
+
+            needs[pos] = {
+                "incoming": inc,
+                "outgoing": out,
+                "net": net,
+                "need_level": need_level,
+            }
+
+            if need_level in ("critical", "moderate"):
+                priority_positions.append(pos)
+
+        # Sort priority by severity
+        severity_order = {"critical": 0, "moderate": 1, "low": 2, "none": 3}
+        priority_positions.sort(key=lambda p: severity_order.get(needs[p]["need_level"], 3))
+
+        total_in = len(incoming_df)
+        total_out = len(outgoing_df)
+        analysis = f"{team} has {total_in} incoming and {total_out} outgoing portal players. "
+        if len(priority_positions) > 0:
+            analysis += f"Priority needs at: {', '.join(priority_positions[:3])}."
+        else:
+            analysis += "No critical position needs identified."
+
+        return APIResponse(
+            status="success",
+            data={
+                "team": team,
+                "needs": needs,
+                "priority_positions": priority_positions,
+                "analysis": analysis,
+            },
+        )
+
+    except (R2NotConfiguredError, R2DataLoadError) as e:
+        logger.error(f"Data error for roster needs: {e}")
+        raise HTTPException(status_code=503, detail="Data unavailable")
+    except Exception as e:
+        logger.error(f"Roster needs error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))

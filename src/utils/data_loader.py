@@ -457,8 +457,12 @@ def calculate_portal_iq_value(
     potential_values = {5: 200000, 4: 100000, 3: 40000, 2: 15000}
     potential_value = potential_values.get(stars, 8000)
 
-    # Final value
+    # Final value (full Portal IQ valuation)
     total_value = int(core_value + social_value + potential_value)
+
+    # Performance Value: pure on-field value (no school, no stars, no social)
+    # This answers: "What is this player worth based ONLY on how they play?"
+    perf_value = int(position_base * perf_mult * starter_bonus)
 
     # Determine tier
     tier = _get_nil_tier(total_value)
@@ -486,6 +490,7 @@ def calculate_portal_iq_value(
 
     return {
         "value": total_value,
+        "performance_value": perf_value,
         "tier": tier,
         "breakdown": {
             "position_base": position_base,
