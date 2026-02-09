@@ -492,29 +492,48 @@ async def nil_leaderboard(
                 message="No players found matching criteria"
             )
 
-        # Build response list
+        # Build response list with Portal IQ calculated valuations
         players = []
         for rank, (_, row) in enumerate(df.iterrows(), start=1):
-            nil_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
+            # Get On3's value as market reference
+            on3_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
             player_name = str(row.get("name", "Unknown"))
+            pos = str(row.get("position", "")).upper()
+            school_name = str(row.get("school", ""))
+            pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
+            stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+
+            # Calculate Portal IQ's own valuation
+            position_base = _get_position_base_value(pos)
+            school_mult = _get_school_multiplier(school_name)
+            perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
+            starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+            social_base = stars * 15000 if stars > 0 else 5000
+            social_value = int(social_base * school_mult)
+            potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
+
+            portal_iq_value = int(
+                position_base * school_mult * perf_mult * starter_bonus + social_value + potential_value
+            )
 
             # Use field names that match frontend expectations
             player_data = {
                 "rank": rank,
                 "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
                 "player_name": player_name,  # Frontend expects player_name
-                "position": str(row.get("position", "")),
-                "school": str(row.get("school", "")),
+                "position": pos,
+                "school": school_name,
                 "conference": str(row.get("conference", "")) if pd.notna(row.get("conference")) else None,
-                "valuation": nil_value,  # Frontend expects valuation
-                "nil_tier": str(row.get("tier", _get_nil_tier(nil_value))),  # Frontend expects nil_tier
+                "valuation": portal_iq_value,  # Portal IQ's calculated value
+                "on3_value": on3_value if on3_value > 0 else None,  # On3 as market reference
+                "nil_tier": _get_nil_tier(portal_iq_value),
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                "valuation_source": str(row.get("valuation_source", "On3")) if pd.notna(row.get("valuation_source")) else "On3",
+                "valuation_source": "Portal IQ",  # Our valuation
                 # Additional fields for detail view
-                "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                "stars": stars if stars > 0 else None,
                 "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
                 "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
-                "pff_overall": float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else None,
+                "pff_overall": pff_overall if pff_overall > 0 else None,
                 "pff_offense": float(row.get("pff_offense", 0)) if pd.notna(row.get("pff_offense")) else None,
                 "pff_defense": float(row.get("pff_defense", 0)) if pd.notna(row.get("pff_defense")) else None,
             }
@@ -598,13 +617,33 @@ async def search_players(
                 )
                 matches = nil_df[mask].head(limit if data_type == "nil" else limit // 2)
                 for _, row in matches.iterrows():
+                    # Calculate Portal IQ's own valuation
+                    pos = str(row.get("position", "")).upper()
+                    school_name = str(row.get("school", ""))
+                    pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
+                    stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+                    on3_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
+
+                    position_base = _get_position_base_value(pos)
+                    school_mult = _get_school_multiplier(school_name)
+                    perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
+                    starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+                    social_base = stars * 15000 if stars > 0 else 5000
+                    social_value = int(social_base * school_mult)
+                    potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
+
+                    portal_iq_value = int(
+                        position_base * school_mult * perf_mult * starter_bonus + social_value + potential_value
+                    )
+
                     results.append({
                         "player_id": str(row.get("player_id", row.get("name", "").replace(" ", "_").lower())),
                         "player_name": str(row.get("name", "")),
-                        "position": str(row.get("position", "")),
-                        "school": str(row.get("school", "")),
-                        "valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
-                        "nil_tier": str(row.get("tier", "")),
+                        "position": pos,
+                        "school": school_name,
+                        "valuation": portal_iq_value,  # Portal IQ's calculated value
+                        "on3_value": on3_value if on3_value > 0 else None,  # On3 as reference
+                        "nil_tier": _get_nil_tier(portal_iq_value),
                         "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
                         "source": "nil",
                     })
@@ -623,14 +662,32 @@ async def search_players(
                     player_name = str(row.get("name", ""))
                     # Avoid duplicates from NIL search
                     if not any(r["player_name"] == player_name for r in results):
+                        # Calculate Portal IQ's valuation for portal players too
+                        pos = str(row.get("position", "")).upper()
+                        school_name = str(row.get("origin_school", ""))
+                        stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+
+                        position_base = _get_position_base_value(pos)
+                        school_mult = _get_school_multiplier(school_name)
+                        starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+                        social_base = stars * 15000 if stars > 0 else 5000
+                        social_value = int(social_base * school_mult)
+                        potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
+
+                        portal_iq_value = int(
+                            position_base * school_mult * starter_bonus + social_value + potential_value
+                        )
+
                         results.append({
                             "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
                             "player_name": player_name,
-                            "position": str(row.get("position", "")),
-                            "school": str(row.get("origin_school", "")),
+                            "position": pos,
+                            "school": school_name,
+                            "valuation": portal_iq_value,  # Portal IQ's calculated value
+                            "nil_tier": _get_nil_tier(portal_iq_value),
                             "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
                             "status": str(row.get("status", "available")),
-                            "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                            "stars": stars if stars > 0 else None,
                             "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
                             "source": "portal",
                         })
@@ -1945,15 +2002,45 @@ async def get_player_stats(
             raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
 
         # Build comprehensive stats response
+        # Extract base data
+        position = str(player_row.get("position", "")).upper()
+        school = str(player_row.get("school", player_row.get("origin_school", "")))
+        pff_overall = float(player_row.get("pff_overall", 0)) if pd.notna(player_row.get("pff_overall")) else 0
+        stars = int(player_row.get("stars", 0)) if pd.notna(player_row.get("stars")) else 0
+
+        # Get On3's value as market reference (NOT our value)
+        on3_raw_value = float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else 0
+        on3_explicit = float(player_row.get("on3_nil_value", 0)) if pd.notna(player_row.get("on3_nil_value")) else None
+        on3_market_value = on3_explicit if on3_explicit else on3_raw_value
+
+        # Calculate Portal IQ's OWN valuation
+        position_base = _get_position_base_value(position)
+        school_mult = _get_school_multiplier(school)
+        perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
+        starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+
+        # Social value estimation (based on star rating and school profile)
+        social_base = stars * 15000 if stars > 0 else 5000
+        social_value = int(social_base * school_mult)
+
+        # Potential value (age/eligibility adjustment - higher for younger/more eligibility)
+        potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
+
+        # Calculate Portal IQ's NIL valuation
+        calculated_nil_value = int(
+            position_base * school_mult * perf_mult * starter_bonus + social_value + potential_value
+        )
+
+        # Use Portal IQ calculated value as the main NIL value
         stats = {
             "name": str(player_row.get("name", player_name)),
-            "position": str(player_row.get("position", "")),
-            "school": str(player_row.get("school", player_row.get("origin_school", ""))),
+            "position": position,
+            "school": school,
             "headshot_url": str(player_row.get("headshot_url")) if pd.notna(player_row.get("headshot_url")) else None,
             "season": season,
-            "nil_value": float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else None,
-            "nil_tier": str(player_row.get("tier", _get_nil_tier(float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else 0))),
-            "stars": int(player_row.get("stars", 0)) if pd.notna(player_row.get("stars")) else None,
+            "nil_value": calculated_nil_value,  # Portal IQ's calculated value
+            "nil_tier": _get_nil_tier(calculated_nil_value),
+            "stars": stars if stars > 0 else None,
             "height": float(player_row.get("height", 0)) if pd.notna(player_row.get("height")) else None,
             "weight": float(player_row.get("weight", 0)) if pd.notna(player_row.get("weight")) else None,
             "pff": {
@@ -2029,40 +2116,43 @@ async def get_player_stats(
             }
 
         # Add valuation breakdown for the frontend
-        nil_value = stats.get("nil_value") or 0
-        has_on3 = pd.notna(player_row.get("on3_nil_value")) if "on3_nil_value" in player_row.index else False
-        on3_value = float(player_row.get("on3_nil_value", 0)) if has_on3 and pd.notna(player_row.get("on3_nil_value")) else None
-
-        # Calculate valuation breakdown
-        position_base = _get_position_base_value(position)
-        school_mult = _get_school_multiplier(stats.get("school", ""))
-        pff_overall = stats.get("pff", {}).get("overall") or 0
-        perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
-        stars = stats.get("stars") or 0
-        starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+        # Use pre-calculated values from earlier (position_base, school_mult, perf_mult, etc.)
+        has_on3_data = on3_market_value > 0
 
         stats["valuation"] = {
-            "on3_value": on3_value,
-            "portal_iq_value": nil_value,
+            "on3_value": on3_market_value if on3_market_value > 0 else None,  # On3's market value as reference
+            "portal_iq_value": calculated_nil_value,  # Portal IQ's calculated value
             "portal_iq_tier": stats.get("nil_tier", "emerging"),
-            "confidence": "high" if has_on3 else ("medium" if pff_overall > 0 else "low"),
-            "has_on3_data": has_on3,
+            "confidence": "high" if has_on3_data else ("medium" if pff_overall > 0 else "low"),
+            "has_on3_data": has_on3_data,
             "breakdown": {
                 "position_base": position_base,
                 "school_multiplier": round(school_mult, 2),
                 "performance_multiplier": round(perf_mult, 2),
                 "starter_bonus": round(starter_bonus, 2),
-                "social_value": 0,
-                "potential_value": 0,
+                "social_value": social_value,
+                "potential_value": potential_value,
             },
             "reasoning": _generate_valuation_reasoning(
                 position=position,
-                school=stats.get("school", ""),
+                school=school,
                 pff_overall=pff_overall,
                 stars=stars,
-                nil_value=nil_value,
+                nil_value=calculated_nil_value,
             ),
         }
+
+        # Add market comparison if On3 data available
+        if has_on3_data:
+            diff = calculated_nil_value - on3_market_value
+            diff_pct = (diff / on3_market_value * 100) if on3_market_value > 0 else 0
+            stats["valuation"]["market_comparison"] = {
+                "on3_reference": on3_market_value,
+                "portal_iq_value": calculated_nil_value,
+                "difference": diff,
+                "difference_pct": round(diff_pct, 1),
+                "assessment": "undervalued" if diff > 0 else ("overvalued" if diff < 0 else "fair value"),
+            }
 
         return APIResponse(status="success", data=stats)
 
