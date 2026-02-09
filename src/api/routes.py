@@ -16,6 +16,8 @@ from ..utils.data_loader import (
     get_nil_players,
     get_portal_players,
     get_database_stats,
+    get_pff_player_stats,
+    calculate_portal_iq_value,
     _get_nil_tier,
 )
 from ..utils.s3_storage import R2NotConfiguredError, R2DataLoadError
@@ -495,7 +497,6 @@ async def nil_leaderboard(
         # Build response list with Portal IQ calculated valuations
         players = []
         for rank, (_, row) in enumerate(df.iterrows(), start=1):
-            # Get On3's value as market reference
             on3_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
             player_name = str(row.get("name", "Unknown"))
             pos = str(row.get("position", "")).upper()
@@ -503,33 +504,21 @@ async def nil_leaderboard(
             pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
             stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
 
-            # Calculate Portal IQ's own valuation
-            position_base = _get_position_base_value(pos)
-            school_mult = _get_school_multiplier(school_name)
-            perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
-            starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
-            social_base = stars * 15000 if stars > 0 else 5000
-            social_value = int(social_base * school_mult)
-            potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
+            # Use the proper valuation model
+            val = calculate_portal_iq_value(pos, school_name, pff_overall, stars)
 
-            portal_iq_value = int(
-                position_base * school_mult * perf_mult * starter_bonus + social_value + potential_value
-            )
-
-            # Use field names that match frontend expectations
             player_data = {
                 "rank": rank,
                 "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
-                "player_name": player_name,  # Frontend expects player_name
+                "player_name": player_name,
                 "position": pos,
                 "school": school_name,
                 "conference": str(row.get("conference", "")) if pd.notna(row.get("conference")) else None,
-                "valuation": portal_iq_value,  # Portal IQ's calculated value
-                "on3_value": on3_value if on3_value > 0 else None,  # On3 as market reference
-                "nil_tier": _get_nil_tier(portal_iq_value),
+                "valuation": val["value"],
+                "on3_value": on3_value if on3_value > 0 else None,
+                "nil_tier": val["tier"],
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                "valuation_source": "Portal IQ",  # Our valuation
-                # Additional fields for detail view
+                "valuation_source": "Portal IQ",
                 "stars": stars if stars > 0 else None,
                 "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
                 "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
@@ -617,33 +606,22 @@ async def search_players(
                 )
                 matches = nil_df[mask].head(limit if data_type == "nil" else limit // 2)
                 for _, row in matches.iterrows():
-                    # Calculate Portal IQ's own valuation
                     pos = str(row.get("position", "")).upper()
                     school_name = str(row.get("school", ""))
                     pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
                     stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
                     on3_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
 
-                    position_base = _get_position_base_value(pos)
-                    school_mult = _get_school_multiplier(school_name)
-                    perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
-                    starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
-                    social_base = stars * 15000 if stars > 0 else 5000
-                    social_value = int(social_base * school_mult)
-                    potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
-
-                    portal_iq_value = int(
-                        position_base * school_mult * perf_mult * starter_bonus + social_value + potential_value
-                    )
+                    val = calculate_portal_iq_value(pos, school_name, pff_overall, stars)
 
                     results.append({
                         "player_id": str(row.get("player_id", row.get("name", "").replace(" ", "_").lower())),
                         "player_name": str(row.get("name", "")),
                         "position": pos,
                         "school": school_name,
-                        "valuation": portal_iq_value,  # Portal IQ's calculated value
-                        "on3_value": on3_value if on3_value > 0 else None,  # On3 as reference
-                        "nil_tier": _get_nil_tier(portal_iq_value),
+                        "valuation": val["value"],
+                        "on3_value": on3_value if on3_value > 0 else None,
+                        "nil_tier": val["tier"],
                         "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
                         "source": "nil",
                     })
@@ -662,29 +640,19 @@ async def search_players(
                     player_name = str(row.get("name", ""))
                     # Avoid duplicates from NIL search
                     if not any(r["player_name"] == player_name for r in results):
-                        # Calculate Portal IQ's valuation for portal players too
                         pos = str(row.get("position", "")).upper()
                         school_name = str(row.get("origin_school", ""))
                         stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
 
-                        position_base = _get_position_base_value(pos)
-                        school_mult = _get_school_multiplier(school_name)
-                        starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
-                        social_base = stars * 15000 if stars > 0 else 5000
-                        social_value = int(social_base * school_mult)
-                        potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
-
-                        portal_iq_value = int(
-                            position_base * school_mult * starter_bonus + social_value + potential_value
-                        )
+                        val = calculate_portal_iq_value(pos, school_name, 0, stars)
 
                         results.append({
                             "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
                             "player_name": player_name,
                             "position": pos,
                             "school": school_name,
-                            "valuation": portal_iq_value,  # Portal IQ's calculated value
-                            "nil_tier": _get_nil_tier(portal_iq_value),
+                            "valuation": val["value"],
+                            "nil_tier": val["tier"],
                             "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
                             "status": str(row.get("status", "available")),
                             "stars": stars if stars > 0 else None,
@@ -2001,145 +1969,191 @@ async def get_player_stats(
         if player_row is None:
             raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
 
-        # Build comprehensive stats response
-        # Extract base data
+        # Extract base data from player row
         position = str(player_row.get("position", "")).upper()
         school = str(player_row.get("school", player_row.get("origin_school", "")))
         pff_overall = float(player_row.get("pff_overall", 0)) if pd.notna(player_row.get("pff_overall")) else 0
         stars = int(player_row.get("stars", 0)) if pd.notna(player_row.get("stars")) else 0
 
-        # Get On3's value as market reference (NOT our value)
+        # Get On3's value as market reference
         on3_raw_value = float(player_row.get("nil_value", 0)) if pd.notna(player_row.get("nil_value")) else 0
         on3_explicit = float(player_row.get("on3_nil_value", 0)) if pd.notna(player_row.get("on3_nil_value")) else None
         on3_market_value = on3_explicit if on3_explicit else on3_raw_value
 
-        # Calculate Portal IQ's OWN valuation
-        position_base = _get_position_base_value(position)
-        school_mult = _get_school_multiplier(school)
-        perf_mult = 1.0 + (pff_overall - 60) / 100 if pff_overall > 60 else 1.0
-        starter_bonus = 1.0 + (stars - 2) * 0.15 if stars > 2 else 1.0
+        # Load detailed PFF stats (box score data: yards, TDs, receptions, etc.)
+        pff_detailed = get_pff_player_stats(player_name, season)
 
-        # Social value estimation (based on star rating and school profile)
-        social_base = stars * 15000 if stars > 0 else 5000
-        social_value = int(social_base * school_mult)
+        # Use PFF detailed data to enrich grades if available
+        if pff_detailed:
+            pff_overall = pff_detailed.get("pff_overall") or pff_overall
 
-        # Potential value (age/eligibility adjustment - higher for younger/more eligibility)
-        potential_value = 25000 if stars >= 4 else (15000 if stars >= 3 else 5000)
-
-        # Calculate Portal IQ's NIL valuation
-        calculated_nil_value = int(
-            position_base * school_mult * perf_mult * starter_bonus + social_value + potential_value
+        # Calculate Portal IQ's valuation using the proper model
+        valuation_result = calculate_portal_iq_value(
+            position=position,
+            school=school,
+            pff_overall=pff_overall,
+            stars=stars,
         )
+        calculated_nil_value = valuation_result["value"]
 
-        # Use Portal IQ calculated value as the main NIL value
+        # Helper to safely get float from either pff_detailed or player_row
+        def _get_stat(key, fallback_key=None):
+            """Get stat from PFF detailed data first, then player_row."""
+            if pff_detailed:
+                val = pff_detailed.get(key)
+                if val is not None:
+                    return float(val)
+            # Fallback to player_row
+            fk = fallback_key or key
+            val = player_row.get(fk)
+            if pd.notna(val) if hasattr(val, '__class__') else val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+            return None
+
+        # Build comprehensive stats response
         stats = {
             "name": str(player_row.get("name", player_name)),
             "position": position,
             "school": school,
             "headshot_url": str(player_row.get("headshot_url")) if pd.notna(player_row.get("headshot_url")) else None,
             "season": season,
-            "nil_value": calculated_nil_value,  # Portal IQ's calculated value
-            "nil_tier": _get_nil_tier(calculated_nil_value),
+            "nil_value": calculated_nil_value,
+            "nil_tier": valuation_result["tier"],
             "stars": stars if stars > 0 else None,
             "height": float(player_row.get("height", 0)) if pd.notna(player_row.get("height")) else None,
             "weight": float(player_row.get("weight", 0)) if pd.notna(player_row.get("weight")) else None,
             "pff": {
-                "overall": float(player_row.get("pff_overall", 0)) if pd.notna(player_row.get("pff_overall")) else None,
-                "offense": float(player_row.get("pff_offense", 0)) if pd.notna(player_row.get("pff_offense")) else None,
-                "defense": float(player_row.get("pff_defense", 0)) if pd.notna(player_row.get("pff_defense")) else None,
-                "passing": float(player_row.get("pff_passing", 0)) if pd.notna(player_row.get("pff_passing")) else None,
-                "rushing": float(player_row.get("pff_rushing", 0)) if pd.notna(player_row.get("pff_rushing")) else None,
-                "receiving": float(player_row.get("pff_receiving", 0)) if pd.notna(player_row.get("pff_receiving")) else None,
-                "pass_block": float(player_row.get("pff_pass_block", 0)) if pd.notna(player_row.get("pff_pass_block")) else None,
-                "run_block": float(player_row.get("pff_run_block", 0)) if pd.notna(player_row.get("pff_run_block")) else None,
-                "pass_rush": float(player_row.get("pff_pass_rush", 0)) if pd.notna(player_row.get("pff_pass_rush")) else None,
-                "run_defense": float(player_row.get("pff_run_defense", 0)) if pd.notna(player_row.get("pff_run_defense")) else None,
-                "tackling": float(player_row.get("pff_tackling", 0)) if pd.notna(player_row.get("pff_tackling")) else None,
-                "coverage": float(player_row.get("pff_coverage", 0)) if pd.notna(player_row.get("pff_coverage")) else None,
+                "overall": _get_stat("pff_overall"),
+                "offense": _get_stat("pff_offense"),
+                "defense": _get_stat("pff_defense"),
+                "passing": _get_stat("pff_passing"),
+                "rushing": _get_stat("pff_rushing"),
+                "receiving": _get_stat("pff_receiving"),
+                "pass_block": _get_stat("pff_pass_block"),
+                "run_block": _get_stat("pff_run_block"),
+                "pass_rush": _get_stat("pff_pass_rush"),
+                "run_defense": _get_stat("pff_run_defense"),
+                "tackling": _get_stat("pff_tackling"),
+                "coverage": _get_stat("pff_coverage"),
             },
         }
 
-        # Add position-specific stats if available
-        position = str(player_row.get("position", "")).upper()
-
+        # Add position-specific box score stats from PFF detailed data
         if position == "QB":
             stats["passing"] = {
-                "passer_rating": float(player_row.get("passer_rating", 0)) if pd.notna(player_row.get("passer_rating")) else None,
-                "completion_pct": float(player_row.get("completion_pct", 0)) if pd.notna(player_row.get("completion_pct")) else None,
-                "big_time_throws": float(player_row.get("big_time_throws", 0)) if pd.notna(player_row.get("big_time_throws")) else None,
-                "big_time_throw_pct": float(player_row.get("big_time_throw_pct", 0)) if pd.notna(player_row.get("big_time_throw_pct")) else None,
-                "turnover_worthy_plays": float(player_row.get("turnover_worthy_plays", 0)) if pd.notna(player_row.get("turnover_worthy_plays")) else None,
-                "yards": float(player_row.get("passing_yards", 0)) if pd.notna(player_row.get("passing_yards")) else None,
-                "touchdowns": float(player_row.get("passing_tds", 0)) if pd.notna(player_row.get("passing_tds")) else None,
+                "passer_rating": _get_stat("passer_rating"),
+                "completion_pct": _get_stat("completion_pct") or _get_stat("adjusted_completion_pct"),
+                "big_time_throws": _get_stat("big_time_throws"),
+                "big_time_throw_pct": _get_stat("big_time_throw_pct"),
+                "turnover_worthy_plays": _get_stat("turnover_worthy_plays"),
+                "yards": _get_stat("yards", "passing_yards"),
+                "touchdowns": _get_stat("touchdowns", "passing_tds"),
+                "avg_depth_of_target": _get_stat("avg_depth_of_target"),
+                "time_to_throw": _get_stat("time_to_throw") or _get_stat("avg_time_to_throw"),
             }
 
         if position in ("RB", "QB"):
             stats["rushing"] = {
-                "elusive_rating": float(player_row.get("elusive_rating", 0)) if pd.notna(player_row.get("elusive_rating")) else None,
-                "yards_after_contact": float(player_row.get("yards_after_contact", 0)) if pd.notna(player_row.get("yards_after_contact")) else None,
-                "breakaway_pct": float(player_row.get("breakaway_pct", 0)) if pd.notna(player_row.get("breakaway_pct")) else None,
-                "yards": float(player_row.get("rushing_yards", 0)) if pd.notna(player_row.get("rushing_yards")) else None,
-                "touchdowns": float(player_row.get("rushing_tds", 0)) if pd.notna(player_row.get("rushing_tds")) else None,
-                "yards_per_carry": float(player_row.get("yards_per_carry", 0)) if pd.notna(player_row.get("yards_per_carry")) else None,
+                "elusive_rating": _get_stat("elusive_rating"),
+                "yards_after_contact": _get_stat("yards_after_contact"),
+                "breakaway_pct": _get_stat("breakaway_pct"),
+                "yards": _get_stat("yards", "rushing_yards") if position == "RB" else _get_stat("rushing_yards"),
+                "touchdowns": _get_stat("touchdowns", "rushing_tds") if position == "RB" else _get_stat("rushing_tds"),
+                "yards_per_carry": _get_stat("yards_per_carry") or _get_stat("ypa"),
+                "attempts": _get_stat("attempts"),
+                "missed_tackles_forced": _get_stat("missed_tackles_forced"),
+                "breakaway_yards": _get_stat("breakaway_yards"),
             }
 
         if position in ("WR", "TE", "RB"):
             stats["receiving"] = {
-                "yards_per_route_run": float(player_row.get("yards_per_route_run", 0)) if pd.notna(player_row.get("yards_per_route_run")) else None,
-                "drop_rate": float(player_row.get("drop_rate", 0)) if pd.notna(player_row.get("drop_rate")) else None,
-                "contested_catch_rate": float(player_row.get("contested_catch_rate", 0)) if pd.notna(player_row.get("contested_catch_rate")) else None,
-                "yards": float(player_row.get("receiving_yards", 0)) if pd.notna(player_row.get("receiving_yards")) else None,
-                "touchdowns": float(player_row.get("receiving_tds", 0)) if pd.notna(player_row.get("receiving_tds")) else None,
+                "receptions": _get_stat("receptions"),
+                "targets": _get_stat("targets"),
+                "yards": _get_stat("rec_yards") or _get_stat("yards", "receiving_yards"),
+                "touchdowns": _get_stat("touchdowns", "receiving_tds") if position != "RB" else _get_stat("receiving_tds"),
+                "yards_per_route_run": _get_stat("yards_per_route_run"),
+                "catch_rate": _get_stat("catch_rate"),
+                "drop_rate": _get_stat("drop_rate"),
+                "drops": _get_stat("drops"),
+                "contested_catch_rate": _get_stat("contested_catch_rate"),
+                "yards_after_catch": _get_stat("yards_after_catch"),
+                "routes_run": _get_stat("routes_run"),
+                "longest": _get_stat("longest"),
             }
 
-        if position in ("EDGE", "DT", "DL", "DE"):
+        if position in ("EDGE", "DT", "DL", "DE", "LB"):
             stats["pass_rush"] = {
-                "pass_rushing_productivity": float(player_row.get("pass_rushing_productivity", 0)) if pd.notna(player_row.get("pass_rushing_productivity")) else None,
-                "pass_rush_win_rate": float(player_row.get("pass_rush_win_rate", 0)) if pd.notna(player_row.get("pass_rush_win_rate")) else None,
-                "pressures": float(player_row.get("pressures", 0)) if pd.notna(player_row.get("pressures")) else None,
-                "sacks": float(player_row.get("sacks", 0)) if pd.notna(player_row.get("sacks")) else None,
+                "pass_rushing_productivity": _get_stat("pass_rushing_productivity"),
+                "pass_rush_win_rate": _get_stat("pass_rush_win_rate"),
+                "pressures": _get_stat("pressures"),
+                "hurries": _get_stat("hurries"),
+                "hits": _get_stat("hits"),
+                "sacks": _get_stat("sacks"),
+                "batted_passes": _get_stat("batted_passes"),
             }
 
         if position in ("CB", "S", "LB"):
             stats["coverage"] = {
-                "passer_rating_allowed": float(player_row.get("passer_rating_allowed", 0)) if pd.notna(player_row.get("passer_rating_allowed")) else None,
-                "yards_per_coverage_snap": float(player_row.get("yards_per_coverage_snap", 0)) if pd.notna(player_row.get("yards_per_coverage_snap")) else None,
-                "interceptions": float(player_row.get("interceptions", 0)) if pd.notna(player_row.get("interceptions")) else None,
-                "pass_breakups": float(player_row.get("pass_breakups", 0)) if pd.notna(player_row.get("pass_breakups")) else None,
+                "passer_rating_allowed": _get_stat("passer_rating_allowed"),
+                "yards_per_coverage_snap": _get_stat("yards_per_coverage_snap"),
+                "interceptions": _get_stat("interceptions") or _get_stat("ints"),
+                "pass_breakups": _get_stat("pass_breakups") or _get_stat("pbus"),
+                "targets_allowed": _get_stat("targets_allowed"),
+                "completions_allowed": _get_stat("completions_allowed"),
+                "yards_allowed": _get_stat("yards_allowed"),
+                "forced_incompletes": _get_stat("forced_incompletes"),
             }
 
         if position in ("OT", "OG", "C", "OL"):
             stats["blocking"] = {
-                "pass_blocking_efficiency": float(player_row.get("pass_blocking_efficiency", 0)) if pd.notna(player_row.get("pass_blocking_efficiency")) else None,
-                "pressures_allowed": float(player_row.get("pressures_allowed", 0)) if pd.notna(player_row.get("pressures_allowed")) else None,
-                "sacks_allowed": float(player_row.get("sacks_allowed", 0)) if pd.notna(player_row.get("sacks_allowed")) else None,
+                "pass_blocking_efficiency": _get_stat("pass_blocking_efficiency"),
+                "pressures_allowed": _get_stat("pressures_allowed"),
+                "sacks_allowed": _get_stat("sacks_allowed"),
+                "hits_allowed": _get_stat("hits_allowed"),
+                "hurries_allowed": _get_stat("hurries_allowed"),
+                "run_block_percent": _get_stat("run_block_percent"),
             }
 
-        # Add valuation breakdown for the frontend
-        # Use pre-calculated values from earlier (position_base, school_mult, perf_mult, etc.)
-        has_on3_data = on3_market_value > 0
+        # Add tackling stats for all defensive players
+        if position in ("CB", "S", "LB", "EDGE", "DT", "DL", "DE"):
+            stats["tackling"] = {
+                "tackles": _get_stat("tackles"),
+                "assists": _get_stat("assists") or _get_stat("tackle_assists"),
+                "tackles_for_loss": _get_stat("tackles_for_loss"),
+                "missed_tackles": _get_stat("missed_tackles"),
+                "missed_tackle_pct": _get_stat("missed_tackle_pct"),
+                "forced_fumbles": _get_stat("forced_fumbles"),
+            }
 
+        # Add snap counts if available
+        off_snaps = _get_stat("offensive_snaps")
+        def_snaps = _get_stat("defensive_snaps")
+        if off_snaps or def_snaps:
+            stats["snaps"] = {
+                "offensive": off_snaps,
+                "defensive": def_snaps,
+                "pass_rush": _get_stat("pass_rush_snaps"),
+                "coverage": _get_stat("coverage_snaps"),
+            }
+
+        # Add games played if available
+        games = _get_stat("games_played")
+        if games:
+            stats["games_played"] = int(games)
+
+        # Build valuation with the new calculator
+        has_on3_data = on3_market_value > 0
         stats["valuation"] = {
-            "on3_value": on3_market_value if on3_market_value > 0 else None,  # On3's market value as reference
-            "portal_iq_value": calculated_nil_value,  # Portal IQ's calculated value
-            "portal_iq_tier": stats.get("nil_tier", "emerging"),
+            "on3_value": on3_market_value if has_on3_data else None,
+            "portal_iq_value": calculated_nil_value,
+            "portal_iq_tier": valuation_result["tier"],
             "confidence": "high" if has_on3_data else ("medium" if pff_overall > 0 else "low"),
             "has_on3_data": has_on3_data,
-            "breakdown": {
-                "position_base": position_base,
-                "school_multiplier": round(school_mult, 2),
-                "performance_multiplier": round(perf_mult, 2),
-                "starter_bonus": round(starter_bonus, 2),
-                "social_value": social_value,
-                "potential_value": potential_value,
-            },
-            "reasoning": _generate_valuation_reasoning(
-                position=position,
-                school=school,
-                pff_overall=pff_overall,
-                stars=stars,
-                nil_value=calculated_nil_value,
-            ),
+            "breakdown": valuation_result["breakdown"],
+            "reasoning": valuation_result["reasoning"],
         }
 
         # Add market comparison if On3 data available

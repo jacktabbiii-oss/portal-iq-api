@@ -264,6 +264,205 @@ def _get_nil_tier(value: float) -> str:
 
 
 # =============================================================================
+# PFF Detailed Stats Functions
+# =============================================================================
+
+def get_pff_player_stats(player_name: str, season: int = 2025) -> Optional[Dict[str, Any]]:
+    """Get detailed PFF stats for a specific player including box score stats.
+
+    Loads from pff_player_grades.csv which has 120+ columns including
+    actual counting stats (yards, TDs, receptions, etc.) not just grades.
+
+    Args:
+        player_name: Player name to search for
+        season: Season year (default 2025)
+
+    Returns:
+        Dict with all available stats, or None if player not found
+    """
+    try:
+        df = _load_csv("pff_player_grades.csv")
+        if df.empty:
+            return None
+
+        # Search by name (case-insensitive)
+        name_lower = player_name.lower()
+        mask = df["name"].str.lower() == name_lower if "name" in df.columns else pd.Series(dtype=bool)
+
+        # Filter by season if available
+        if "season" in df.columns and not mask.empty:
+            season_mask = mask & (df["season"] == season)
+            matches = df[season_mask]
+            if matches.empty:
+                # Try without season filter
+                matches = df[mask]
+        else:
+            matches = df[mask]
+
+        if matches.empty:
+            # Try partial match
+            mask = df["name"].str.lower().str.contains(name_lower, na=False) if "name" in df.columns else pd.Series(dtype=bool)
+            matches = df[mask]
+
+        if matches.empty:
+            return None
+
+        # Use the most recent / highest-graded entry
+        if "pff_overall" in matches.columns:
+            row = matches.sort_values("pff_overall", ascending=False).iloc[0]
+        else:
+            row = matches.iloc[0]
+
+        # Convert to dict, replacing NaN with None
+        stats = {}
+        for col in row.index:
+            val = row[col]
+            if pd.isna(val):
+                stats[col] = None
+            elif isinstance(val, (int, float)):
+                stats[col] = float(val)
+            else:
+                stats[col] = str(val)
+
+        return stats
+
+    except (R2NotConfiguredError, R2DataLoadError):
+        logger.warning("Could not load PFF stats from R2")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading PFF stats for {player_name}: {e}")
+        return None
+
+
+# =============================================================================
+# Portal IQ Valuation Calculator
+# =============================================================================
+
+def calculate_portal_iq_value(
+    position: str,
+    school: str,
+    pff_overall: float = 0,
+    stars: int = 0,
+) -> Dict[str, Any]:
+    """Calculate Portal IQ's proprietary NIL valuation.
+
+    Uses position market value, school brand power, on-field performance,
+    and recruiting profile to calculate a fair market NIL value.
+
+    Returns dict with: value, tier, breakdown, reasoning
+    """
+    position = position.upper() if position else ""
+
+    # Position base value (reflects market demand for each position)
+    position_values = {
+        "QB": 200000, "WR": 100000, "RB": 80000, "TE": 60000,
+        "OT": 70000, "OG": 50000, "C": 50000, "OL": 60000,
+        "EDGE": 80000, "DT": 60000, "DE": 80000, "DL": 65000,
+        "LB": 60000, "CB": 80000, "S": 60000,
+        "K": 15000, "P": 12000, "LS": 10000,
+    }
+    position_base = position_values.get(position, 40000)
+
+    # School brand multiplier (reflects NIL market size)
+    tier1_schools = {
+        "Ohio State", "Alabama", "Georgia", "Michigan", "Texas", "USC",
+        "LSU", "Oregon", "Clemson", "Notre Dame", "Penn State", "Tennessee",
+        "Florida", "Oklahoma", "Miami", "Texas A&M",
+    }
+    tier2_schools = {
+        "Auburn", "Wisconsin", "Arkansas", "Iowa", "Ole Miss", "NC State",
+        "Missouri", "Kentucky", "South Carolina", "Colorado", "Nebraska",
+        "Michigan State", "UCLA", "Washington", "Arizona", "Utah",
+        "Virginia Tech", "Louisville", "Pittsburgh", "Florida State",
+        "Baylor", "Kansas State", "TCU", "Iowa State", "Illinois",
+        "Maryland", "Minnesota", "Oregon State", "Cal", "Stanford",
+        "West Virginia", "Syracuse", "Duke", "Wake Forest", "Georgia Tech",
+        "North Carolina", "Boston College", "Virginia", "Vanderbilt",
+        "Mississippi State", "Purdue", "Indiana", "Rutgers", "Northwestern",
+    }
+
+    if school in tier1_schools:
+        school_mult = 3.5
+    elif school in tier2_schools:
+        school_mult = 2.0
+    else:
+        school_mult = 0.8  # G5/FCS
+
+    # Performance multiplier (PFF grade)
+    if pff_overall >= 90:
+        perf_mult = 3.0
+    elif pff_overall >= 80:
+        perf_mult = 2.2
+    elif pff_overall >= 70:
+        perf_mult = 1.5
+    elif pff_overall >= 60:
+        perf_mult = 1.0
+    elif pff_overall > 0:
+        perf_mult = 0.6
+    else:
+        # No PFF data - estimate from star rating
+        perf_mult = {5: 1.5, 4: 1.2, 3: 0.9, 2: 0.6}.get(stars, 0.4)
+
+    # Star/recruiting multiplier
+    star_mult_values = {5: 4.0, 4: 2.0, 3: 1.3, 2: 0.7, 1: 0.3}
+    star_mult = star_mult_values.get(stars, 0.2) if stars > 0 else 0.2
+
+    # Core calculated value
+    core_value = position_base * school_mult * perf_mult * star_mult
+
+    # Social media value estimate (based on profile, not actual follower counts)
+    if stars > 0:
+        social_value = min(int(stars * 50000 * (school_mult / 3.5)), 500000)
+    else:
+        social_value = 5000
+
+    # Potential premium (recruiting ceiling)
+    potential_values = {5: 150000, 4: 75000, 3: 25000, 2: 10000}
+    potential_value = potential_values.get(stars, 5000)
+
+    # Final value
+    total_value = int(core_value + social_value + potential_value)
+
+    # Determine tier
+    tier = _get_nil_tier(total_value)
+
+    # Generate reasoning
+    reasoning = []
+    if position in ("QB", "WR", "CB", "EDGE", "DE", "RB"):
+        reasoning.append(f"{position} is a premium NIL position with high market demand")
+    if school in tier1_schools:
+        reasoning.append(f"{school} is a Tier 1 NIL market with elite brand value")
+    elif school in tier2_schools:
+        reasoning.append(f"{school} is a strong Power conference program")
+    if pff_overall >= 80:
+        reasoning.append(f"Elite on-field performance (grade: {pff_overall:.1f}) commands premium valuation")
+    elif pff_overall >= 70:
+        reasoning.append(f"Strong on-field performance (grade: {pff_overall:.1f}) supports higher valuation")
+    elif pff_overall >= 60:
+        reasoning.append(f"Solid on-field production (grade: {pff_overall:.1f})")
+    if stars >= 5:
+        reasoning.append("5-star recruit with maximum recruiting premium and national profile")
+    elif stars >= 4:
+        reasoning.append("4-star recruit with strong recruiting pedigree")
+    elif stars >= 3:
+        reasoning.append("3-star recruit with development potential")
+
+    return {
+        "value": total_value,
+        "tier": tier,
+        "breakdown": {
+            "position_base": position_base,
+            "school_multiplier": round(school_mult, 2),
+            "performance_multiplier": round(perf_mult, 2),
+            "star_multiplier": round(star_mult, 2),
+            "social_value": social_value,
+            "potential_value": potential_value,
+        },
+        "reasoning": reasoning,
+    }
+
+
+# =============================================================================
 # Transfer Portal Functions
 # =============================================================================
 
