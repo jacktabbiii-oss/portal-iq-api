@@ -364,12 +364,13 @@ def calculate_portal_iq_value(
     position_base = position_values.get(position, 40000)
 
     # School brand multiplier (reflects NIL market size)
-    tier1_schools = {
+    # Use startswith matching to handle "Penn State Nittany Lions" -> "Penn State"
+    tier1_schools = [
         "Ohio State", "Alabama", "Georgia", "Michigan", "Texas", "USC",
         "LSU", "Oregon", "Clemson", "Notre Dame", "Penn State", "Tennessee",
         "Florida", "Oklahoma", "Miami", "Texas A&M",
-    }
-    tier2_schools = {
+    ]
+    tier2_schools = [
         "Auburn", "Wisconsin", "Arkansas", "Iowa", "Ole Miss", "NC State",
         "Missouri", "Kentucky", "South Carolina", "Colorado", "Nebraska",
         "Michigan State", "UCLA", "Washington", "Arizona", "Utah",
@@ -379,11 +380,21 @@ def calculate_portal_iq_value(
         "West Virginia", "Syracuse", "Duke", "Wake Forest", "Georgia Tech",
         "North Carolina", "Boston College", "Virginia", "Vanderbilt",
         "Mississippi State", "Purdue", "Indiana", "Rutgers", "Northwestern",
-    }
+    ]
 
-    if school in tier1_schools:
+    # Normalize school name (strip mascot suffixes)
+    school_normalized = school.strip()
+
+    def _school_matches(school_name: str, school_list: list) -> bool:
+        """Check if school matches any in the list (handles mascot suffixes)."""
+        for s in school_list:
+            if school_name == s or school_name.startswith(s + " "):
+                return True
+        return False
+
+    if _school_matches(school_normalized, tier1_schools):
         school_mult = 3.5
-    elif school in tier2_schools:
+    elif _school_matches(school_normalized, tier2_schools):
         school_mult = 2.0
     else:
         school_mult = 0.8  # G5/FCS
@@ -430,9 +441,9 @@ def calculate_portal_iq_value(
     reasoning = []
     if position in ("QB", "WR", "CB", "EDGE", "DE", "RB"):
         reasoning.append(f"{position} is a premium NIL position with high market demand")
-    if school in tier1_schools:
+    if _school_matches(school_normalized, tier1_schools):
         reasoning.append(f"{school} is a Tier 1 NIL market with elite brand value")
-    elif school in tier2_schools:
+    elif _school_matches(school_normalized, tier2_schools):
         reasoning.append(f"{school} is a strong Power conference program")
     if pff_overall >= 80:
         reasoning.append(f"Elite on-field performance (grade: {pff_overall:.1f}) commands premium valuation")
@@ -489,7 +500,11 @@ def get_portal_players(
     Returns:
         DataFrame with portal players
     """
-    df = _load_csv("on3_transfer_portal.csv")
+    # Try current cycle first (has active + committed players)
+    df = _load_csv("on3_transfer_portal_current.csv")
+    if df.empty:
+        # Fallback to historical data
+        df = _load_csv("on3_transfer_portal.csv")
 
     if df.empty:
         logger.warning("No portal data found")

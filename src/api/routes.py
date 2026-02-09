@@ -884,17 +884,40 @@ async def portal_active(
 
         total_count = len(df)
 
+        # Compute aggregate stats BEFORE pagination (across all matching data)
+        active_count = 0
+        committed_count = 0
+        schools_set = set()
+
+        if not df.empty and "status" in df.columns:
+            status_lower = df["status"].str.lower()
+            active_count = int((~status_lower.isin(["committed", "withdrawn"])).sum())
+            committed_count = int((status_lower == "committed").sum())
+
+        if not df.empty and "origin_school" in df.columns:
+            schools_set = set(df["origin_school"].dropna().unique())
+        if not df.empty and "destination_school" in df.columns:
+            dest_schools = set(df["destination_school"].dropna().unique())
+            schools_set = schools_set | dest_schools
+
         # Apply pagination
         df = df.iloc[offset:offset + limit]
 
         if df.empty:
             return APIResponse(
                 status="success",
-                data={"players": [], "total": 0},
+                data={
+                    "players": [],
+                    "total": 0,
+                    "total_count": total_count,
+                    "active_in_portal": active_count,
+                    "committed": committed_count,
+                    "schools_active": len(schools_set),
+                },
                 message="No portal players found matching criteria"
             )
 
-        # Build response list
+        # Build response list with Portal IQ valuations
         players = []
         for _, row in df.iterrows():
             player_name = str(row.get("name", "Unknown"))
@@ -908,21 +931,31 @@ async def portal_active(
             else:
                 player_status = "available"
 
+            # Calculate Portal IQ valuation for this portal player
+            pos = str(row.get("position", "")).upper()
+            school_name = str(row.get("origin_school", ""))
+            stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+            pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
+            on3_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
+
+            val = calculate_portal_iq_value(pos, school_name, pff_overall, stars)
+
             player_data = {
                 "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
                 "player_name": player_name,
-                "position": str(row.get("position", "")),
-                "origin_school": str(row.get("origin_school", "")),
+                "position": pos,
+                "origin_school": school_name,
                 "origin_conference": str(row.get("conference")) if pd.notna(row.get("conference")) else None,
                 "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
-                "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                "stars": stars if stars > 0 else None,
                 "status": player_status,
-                "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                "nil_valuation": val["value"],  # Portal IQ calculated value
+                "on3_value": on3_value if on3_value > 0 else None,
+                "nil_tier": val["tier"],
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
-                # Additional fields for detail view
                 "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
                 "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
-                "pff_overall": float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else None,
+                "pff_overall": pff_overall if pff_overall > 0 else None,
             }
             players.append(player_data)
 
@@ -931,7 +964,10 @@ async def portal_active(
             data={
                 "players": players,
                 "total": len(players),
-                "total_count": total_count,  # Total matching players (for pagination)
+                "total_count": total_count,
+                "active_in_portal": active_count,
+                "committed": committed_count,
+                "schools_active": len(schools_set),
                 "offset": offset,
                 "limit": limit,
                 "has_more": offset + len(players) < total_count,
