@@ -271,6 +271,32 @@ def main():
             upload_to_r2(year_df, f"draft/{year}_nfl_draft.csv")
 
     # ==========================================================================
+    # Process UDFA Data (2023-2025)
+    # ==========================================================================
+    print("\n" + "=" * 60)
+    print("PROCESSING UDFA DATA (2023-2025)")
+    print("=" * 60)
+
+    all_udfa_data = []
+
+    for year in range(2023, 2026):
+        udfa_file = downloads_path / f"{year} NFL Undrafted Free Agents.csv"
+        if udfa_file.exists():
+            df = pd.read_csv(udfa_file, encoding='utf-8')
+            # Clean column names (strip whitespace)
+            df.columns = [" ".join(str(c).split()) for c in df.columns]
+            print(f"  Loaded {len(df)} UDFAs from {year}")
+            all_udfa_data.append(df)
+            # Upload individual year
+            upload_to_r2(df, f"draft/{year} NFL Undrafted Free Agents.csv")
+        else:
+            print(f"  NOT FOUND: {udfa_file}")
+
+    if all_udfa_data:
+        combined_udfa = pd.concat(all_udfa_data, ignore_index=True)
+        print(f"\nTotal UDFAs: {len(combined_udfa)} ({len(all_udfa_data)} years)")
+
+    # ==========================================================================
     # Process Combine Data
     # ==========================================================================
     print("\n" + "=" * 60)
@@ -304,6 +330,9 @@ def main():
     if all_draft_data:
         print(f"Draft data: {len(combined_draft)} picks ({len(all_draft_data)} years)")
         print(f"  Years: {sorted(combined_draft['year'].unique().tolist())}")
+
+    if all_udfa_data:
+        print(f"UDFA data: {len(combined_udfa)} signings ({len(all_udfa_data)} years)")
 
     if combine_file.exists():
         print(f"Combine data: {len(combine_df)} records")
