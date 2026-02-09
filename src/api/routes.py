@@ -484,31 +484,32 @@ async def nil_leaderboard(
 
         total_count = len(df)
 
-        # Apply pagination
-        df = df.iloc[offset:offset + limit]
-
         if df.empty:
             return APIResponse(
                 status="success",
-                data={"players": [], "total": 0},
+                data={
+                    "players": [], "total": 0, "total_count": 0,
+                    "avg_value": 0, "market_cap": 0,
+                    "offset": offset, "limit": limit, "has_more": False,
+                    "filters_applied": {"position": position, "school": school, "conference": conference, "search": search},
+                },
                 message="No players found matching criteria"
             )
 
-        # Build response list with Portal IQ calculated valuations
-        players = []
-        for rank, (_, row) in enumerate(df.iterrows(), start=1):
+        # Calculate Portal IQ valuations for ALL matching players (before pagination)
+        # This lets us compute accurate market stats and sort by value
+        all_players = []
+        for _, row in df.iterrows():
             on3_value = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0
             player_name = str(row.get("name", "Unknown"))
             pos = str(row.get("position", "")).upper()
             school_name = str(row.get("school", ""))
             pff_overall = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
-            stars = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
+            stars_val = int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0
 
-            # Use the proper valuation model
-            val = calculate_portal_iq_value(pos, school_name, pff_overall, stars)
+            val = calculate_portal_iq_value(pos, school_name, pff_overall, stars_val)
 
-            player_data = {
-                "rank": rank,
+            all_players.append({
                 "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
                 "player_name": player_name,
                 "position": pos,
@@ -519,24 +520,40 @@ async def nil_leaderboard(
                 "nil_tier": val["tier"],
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
                 "valuation_source": "Portal IQ",
-                "stars": stars if stars > 0 else None,
+                "stars": stars_val if stars_val > 0 else None,
                 "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
                 "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
                 "pff_overall": pff_overall if pff_overall > 0 else None,
                 "pff_offense": float(row.get("pff_offense", 0)) if pd.notna(row.get("pff_offense")) else None,
                 "pff_defense": float(row.get("pff_defense", 0)) if pd.notna(row.get("pff_defense")) else None,
-            }
-            players.append(player_data)
+            })
+
+        # Sort all players by Portal IQ valuation (highest first)
+        all_players.sort(key=lambda p: p["valuation"], reverse=True)
+
+        # Calculate market stats across ALL matching players
+        all_values = [p["valuation"] for p in all_players]
+        market_cap = sum(all_values)
+        avg_value = int(market_cap / len(all_values)) if all_values else 0
+
+        # Assign global ranks (after sorting)
+        for i, p in enumerate(all_players):
+            p["rank"] = i + 1
+
+        # Apply pagination AFTER sorting and ranking
+        paginated = all_players[offset:offset + limit]
 
         return APIResponse(
             status="success",
             data={
-                "players": players,
-                "total": len(players),
-                "total_count": total_count,  # Total matching players (for pagination)
+                "players": paginated,
+                "total": len(paginated),
+                "total_count": total_count,
+                "avg_value": avg_value,
+                "market_cap": market_cap,
                 "offset": offset,
                 "limit": limit,
-                "has_more": offset + len(players) < total_count,
+                "has_more": offset + len(paginated) < total_count,
                 "filters_applied": {
                     "position": position,
                     "school": school,

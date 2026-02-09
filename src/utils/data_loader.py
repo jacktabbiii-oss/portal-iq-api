@@ -380,6 +380,13 @@ def calculate_portal_iq_value(
         "West Virginia", "Syracuse", "Duke", "Wake Forest", "Georgia Tech",
         "North Carolina", "Boston College", "Virginia", "Vanderbilt",
         "Mississippi State", "Purdue", "Indiana", "Rutgers", "Northwestern",
+        # Big 12 expansion (2023+)
+        "Cincinnati", "Houston", "UCF", "BYU", "Arizona State",
+        # Other notable programs
+        "Memphis", "SMU", "Tulane", "Boise State", "James Madison",
+        "Liberty", "UNLV", "San Jose State", "Fresno State", "App State",
+        "Appalachian State", "Coastal Carolina", "Jacksonville State",
+        "Sam Houston", "Kennesaw State",
     ]
 
     # Normalize school name (strip mascot suffixes)
@@ -415,21 +422,40 @@ def calculate_portal_iq_value(
         perf_mult = {5: 1.5, 4: 1.2, 3: 0.9, 2: 0.6}.get(stars, 0.4)
 
     # Star/recruiting multiplier
-    star_mult_values = {5: 4.0, 4: 2.0, 3: 1.3, 2: 0.7, 1: 0.3}
-    star_mult = star_mult_values.get(stars, 0.2) if stars > 0 else 0.2
+    star_mult_values = {5: 4.0, 4: 2.5, 3: 1.5, 2: 0.8, 1: 0.4}
+    if stars > 0:
+        star_mult = star_mult_values.get(stars, 0.4)
+    else:
+        # No star data: estimate from performance grade
+        # Most roster players without star data are 2-3 star equivalent
+        if pff_overall >= 80:
+            star_mult = 1.8  # Playing like a 4-star
+        elif pff_overall >= 70:
+            star_mult = 1.3  # Playing like a 3-star
+        elif pff_overall >= 60:
+            star_mult = 0.9  # Solid contributor
+        else:
+            star_mult = 0.5  # Depth/scout team
+
+    # Starter bonus: players with PFF data are rostered starters (minimum floor)
+    starter_bonus = 1.0
+    if pff_overall >= 65:
+        starter_bonus = 1.3  # Active starters get a floor boost
 
     # Core calculated value
-    core_value = position_base * school_mult * perf_mult * star_mult
+    core_value = position_base * school_mult * perf_mult * star_mult * starter_bonus
 
     # Social media value estimate (based on profile, not actual follower counts)
-    if stars > 0:
-        social_value = min(int(stars * 50000 * (school_mult / 3.5)), 500000)
+    if stars >= 4:
+        social_value = min(int(stars * 75000 * (school_mult / 3.5)), 500000)
+    elif stars > 0:
+        social_value = min(int(stars * 40000 * (school_mult / 3.5)), 250000)
     else:
-        social_value = 5000
+        social_value = int(10000 * (school_mult / 2.0))
 
     # Potential premium (recruiting ceiling)
-    potential_values = {5: 150000, 4: 75000, 3: 25000, 2: 10000}
-    potential_value = potential_values.get(stars, 5000)
+    potential_values = {5: 200000, 4: 100000, 3: 40000, 2: 15000}
+    potential_value = potential_values.get(stars, 8000)
 
     # Final value
     total_value = int(core_value + social_value + potential_value)
@@ -466,6 +492,7 @@ def calculate_portal_iq_value(
             "school_multiplier": round(school_mult, 2),
             "performance_multiplier": round(perf_mult, 2),
             "star_multiplier": round(star_mult, 2),
+            "starter_bonus": round(starter_bonus, 2),
             "social_value": social_value,
             "potential_value": potential_value,
         },
