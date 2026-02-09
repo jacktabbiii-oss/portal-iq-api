@@ -5,6 +5,7 @@ and roster optimization.
 """
 
 import logging
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,15 @@ from ..utils.data_loader import (
     get_player_pff_stats,
     get_player_dual_valuation,
     _get_nil_tier,
+    normalize_school_name,
+    calculate_player_war,
+    get_team_roster_composition,
+    get_team_pff_summary,
+    get_team_cfbd_profile,
+    get_on3_team_portal_rankings,
+    get_roster_needs,
+    get_team_logo_url,
+    IDEAL_ROSTER,
 )
 from ..utils.s3_storage import R2NotConfiguredError, R2DataLoadError
 
@@ -323,32 +333,82 @@ async def transfer_impact(
         except Exception as e:
             logger.error(f"Transfer impact error: {e}")
 
-    # Demo fallback
-    current = _calculate_demo_nil_value(player_dict)
-    target_mult = _get_school_multiplier(body.target_school)
-    current_mult = _get_school_multiplier(body.player.school)
-    projected = current * (target_mult / current_mult) if current_mult else current
+    # Data-driven transfer impact using real NIL data and school tiers
+    try:
+        # Look up player's real NIL value
+        nil_df = get_nil_players(limit=50000)
+        name_col = "name" if "name" in nil_df.columns else "player_name"
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
+        player_name_lower = body.player.name.lower()
 
-    response_data = TransferImpactResponse(
-        player_name=body.player.name,
-        current_school=body.player.school,
-        target_school=body.target_school,
-        current_value=current,
-        projected_value=projected,
-        value_change=projected - current,
-        value_change_pct=((projected - current) / current * 100) if current else 0,
-        factors={
-            "market_size": "Market size adjustment",
-            "program_brand": "Program brand factor",
-        },
-        recommendation="Transfer analysis based on market factors",
-    )
+        current_value = 0
+        if not nil_df.empty:
+            match = nil_df[nil_df[name_col].str.lower() == player_name_lower]
+            if match.empty:
+                match = nil_df[nil_df[name_col].str.contains(body.player.name, case=False, na=False)]
+            if not match.empty and val_col in match.columns:
+                current_value = float(match[val_col].iloc[0])
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode",
-    )
+        if current_value == 0:
+            current_value = _calculate_demo_nil_value(player_dict)
+
+        # Get school tier multipliers
+        try:
+            from ..models.school_tiers import get_school_multiplier
+            target_mult = get_school_multiplier(body.target_school)
+            current_mult = get_school_multiplier(body.player.school)
+        except Exception:
+            target_mult = _get_school_multiplier(body.target_school)
+            current_mult = _get_school_multiplier(body.player.school)
+
+        projected_value = current_value * (target_mult / max(current_mult, 0.5))
+
+        # Build detailed factors
+        factors = {}
+        mult_ratio = target_mult / max(current_mult, 0.5)
+        if mult_ratio > 1.2:
+            factors["program_upgrade"] = f"Moving from {current_mult:.1f}x to {target_mult:.1f}x school multiplier (+{(mult_ratio - 1) * 100:.0f}%)"
+        elif mult_ratio < 0.8:
+            factors["program_downgrade"] = f"Moving from {current_mult:.1f}x to {target_mult:.1f}x school multiplier ({(mult_ratio - 1) * 100:.0f}%)"
+        else:
+            factors["lateral_move"] = "Similar program tier — minimal NIL impact from school change"
+
+        # Media market factor
+        if target_mult >= 2.3:
+            factors["media_market"] = "Elite program provides national visibility — premium NIL opportunities"
+        elif target_mult >= 1.4:
+            factors["media_market"] = "Strong P4 program — solid regional and national exposure"
+
+        value_change = projected_value - current_value
+        value_change_pct = (value_change / current_value * 100) if current_value > 0 else 0
+
+        # Recommendation
+        if value_change_pct > 50:
+            recommendation = f"Strong NIL upgrade: projected +${value_change:,.0f} ({value_change_pct:+.0f}%). Transfer would significantly increase earning potential."
+        elif value_change_pct > 10:
+            recommendation = f"Moderate NIL increase: projected +${value_change:,.0f} ({value_change_pct:+.0f}%). Transfer offers improved market positioning."
+        elif value_change_pct > -10:
+            recommendation = f"NIL-neutral move (${value_change:+,.0f}). Decision should be based on playing time, development, and fit."
+        else:
+            recommendation = f"NIL decrease: projected ${value_change:,.0f} ({value_change_pct:+.0f}%). Consider whether other factors outweigh financial impact."
+
+        response_data = TransferImpactResponse(
+            player_name=body.player.name,
+            current_school=body.player.school,
+            target_school=body.target_school,
+            current_value=round(current_value),
+            projected_value=round(projected_value),
+            value_change=round(value_change),
+            value_change_pct=round(value_change_pct, 1),
+            factors=factors,
+            recommendation=recommendation,
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except Exception as e:
+        logger.error(f"Transfer impact fallback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Transfer impact analysis failed: {str(e)}")
 
 
 @router.get(
@@ -614,135 +674,133 @@ async def market_report(
     api_key: str = Depends(require_api_key),
 ):
     """Generate NIL market report with optional position/conference filters."""
-    from pathlib import Path
+    try:
+        # Load real data from R2
+        df = get_nil_players(limit=50000)
+        if df.empty:
+            raise HTTPException(status_code=503, detail="NIL data unavailable")
 
-    # Try to load real data from CSV first
-    data_dir = Path(__file__).parent.parent.parent / "data" / "processed"
-    valuations_file = data_dir / "nil_valuations_2025.csv"
-    if not valuations_file.exists():
-        valuations_file = data_dir / "nil_valuations_2024.csv"
+        # Determine value column
+        val_col = "nil_value"
+        for candidate in ["nil_value", "custom_nil_value", "predicted_nil"]:
+            if candidate in df.columns:
+                val_col = candidate
+                break
 
-    if valuations_file.exists():
-        try:
-            df = pd.read_csv(valuations_file)
+        # Apply filters
+        filters = {}
+        if body.position:
+            if "position" in df.columns:
+                df = df[df["position"].str.upper() == body.position.upper()]
+            filters["position"] = body.position
+        if body.conference:
+            if "conference" in df.columns:
+                df = df[df["conference"].str.lower() == body.conference.lower()]
+            filters["conference"] = body.conference
 
-            # Apply filters
-            filters = {}
-            if body.position:
-                df = df[df['position'].str.upper() == body.position.upper()]
-                filters["position"] = body.position
-            if body.conference:
-                df = df[df['conference'].str.lower() == body.conference.lower()]
-                filters["conference"] = body.conference
+        # Calculate stats
+        total_players = len(df)
+        values = pd.to_numeric(df[val_col], errors="coerce").fillna(0)
+        average_value = float(values.mean()) if total_players > 0 else 0
+        median_value = float(values.median()) if total_players > 0 else 0
+        total_market_value = float(values.sum())
 
-            # Calculate stats
-            total_players = len(df)
-            average_value = df['custom_nil_value'].mean() if total_players > 0 else 0
-            median_value = df['custom_nil_value'].median() if total_players > 0 else 0
-            total_market_value = df['custom_nil_value'].sum()
-
-            # Value by tier
-            value_by_tier = {}
-            if 'nil_tier' in df.columns:
-                for tier in df['nil_tier'].unique():
-                    tier_df = df[df['nil_tier'] == tier]
-                    value_by_tier[tier] = {
-                        "count": len(tier_df),
-                        "avg_value": tier_df['custom_nil_value'].mean()
+        # Value by tier
+        value_by_tier = {}
+        tier_col = "nil_tier" if "nil_tier" in df.columns else None
+        if tier_col:
+            for tier in df[tier_col].dropna().unique():
+                tier_mask = df[tier_col] == tier
+                tier_vals = values[tier_mask]
+                value_by_tier[str(tier)] = {
+                    "count": int(tier_mask.sum()),
+                    "avg_value": float(tier_vals.mean()) if len(tier_vals) > 0 else 0,
+                }
+        else:
+            # Calculate tiers from values
+            for tier_name, tier_min in [("mega", 2000000), ("premium", 500000),
+                                         ("solid", 100000), ("moderate", 25000), ("entry", 0)]:
+                if tier_name == "entry":
+                    tier_mask = values < 25000
+                elif tier_name == "moderate":
+                    tier_mask = (values >= 25000) & (values < 100000)
+                elif tier_name == "solid":
+                    tier_mask = (values >= 100000) & (values < 500000)
+                elif tier_name == "premium":
+                    tier_mask = (values >= 500000) & (values < 2000000)
+                else:
+                    tier_mask = values >= 2000000
+                tier_vals = values[tier_mask]
+                if len(tier_vals) > 0:
+                    value_by_tier[tier_name] = {
+                        "count": int(tier_mask.sum()),
+                        "avg_value": float(tier_vals.mean()),
                     }
 
-            # Top players (map to frontend expected fields)
-            top_df = df.nlargest(25, 'custom_nil_value')
-            top_players = []
-            for _, row in top_df.iterrows():
-                player = {
-                    "name": row.get('player_name', 'Unknown'),
-                    "school": row.get('school', 'Unknown'),
-                    "position": row.get('position', 'Unknown'),
-                    "value": row.get('custom_nil_value', 0),
-                }
-                # Add optional fields if they exist
-                if 'espn_headshot_url' in row and pd.notna(row['espn_headshot_url']):
-                    player["headshot_url"] = row['espn_headshot_url']
-                if 'nil_tier' in row:
-                    player["tier"] = row['nil_tier']
-                top_players.append(player)
+        # Top players
+        df["_sort_val"] = values
+        top_df = df.nlargest(25, "_sort_val")
+        top_players = []
+        name_col = "name" if "name" in df.columns else "player_name"
+        school_col = "school" if "school" in df.columns else "team"
+        for _, row in top_df.iterrows():
+            player = {
+                "name": str(row.get(name_col, "Unknown")),
+                "school": str(row.get(school_col, "Unknown")),
+                "position": str(row.get("position", "Unknown")),
+                "value": float(row.get("_sort_val", 0)),
+            }
+            for img_col in ["espn_headshot_url", "headshot_url", "image_url"]:
+                if img_col in row and pd.notna(row[img_col]):
+                    player["headshot_url"] = str(row[img_col])
+                    break
+            if tier_col and pd.notna(row.get(tier_col)):
+                player["tier"] = str(row[tier_col])
+            top_players.append(player)
 
-            response_data = MarketReportResponse(
-                filters_applied=filters,
-                total_players=total_players,
-                average_value=average_value,
-                median_value=median_value,
-                total_market_value=total_market_value,
-                value_by_tier=value_by_tier,
-                top_players=top_players,
-                market_trends=[
-                    f"Total market value: ${total_market_value:,.0f}",
-                    f"Average player value: ${average_value:,.0f}",
-                    f"Top valued positions: QB, WR, EDGE",
-                ],
-            )
+        # Position breakdown for trends
+        pos_avgs = {}
+        if "position" in df.columns:
+            for pos in ["QB", "WR", "RB", "EDGE", "CB", "OT", "TE", "LB", "S", "DT"]:
+                pos_mask = df["position"].str.upper() == pos
+                pos_vals = values[pos_mask]
+                if len(pos_vals) > 0:
+                    pos_avgs[pos] = float(pos_vals.mean())
+            top_positions = sorted(pos_avgs.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_pos_str = ", ".join(f"{p}" for p, _ in top_positions)
+        else:
+            top_pos_str = "QB, WR, EDGE"
 
-            return APIResponse(
-                status="success",
-                data=response_data.model_dump(),
-                message="Real data from valuations",
-            )
+        response_data = MarketReportResponse(
+            filters_applied=filters,
+            total_players=total_players,
+            average_value=average_value,
+            median_value=median_value,
+            total_market_value=total_market_value,
+            value_by_tier=value_by_tier,
+            top_players=top_players,
+            market_trends=[
+                f"Total FBS market value: ${total_market_value:,.0f} across {total_players:,} players",
+                f"Average: ${average_value:,.0f} | Median: ${median_value:,.0f}",
+                f"Highest valued positions: {top_pos_str}",
+            ],
+        )
 
-        except Exception as e:
-            logger.error(f"Market report CSV error: {e}")
+        return APIResponse(
+            status="success",
+            data=response_data.model_dump(),
+        )
 
-    # Demo fallback if no CSV available
-    models = get_models(request)
-    nil_valuator = models.get("nil_valuator")
-
-    if nil_valuator is not None:
-        try:
-            report = nil_valuator.generate_position_market_report(
-                position=body.position,
-                conference=body.conference,
-            )
-            if report:
-                return APIResponse(status="success", data=report)
-        except Exception as e:
-            logger.error(f"Market report error: {e}")
-
-    # Final demo fallback
-    filters = {}
-    if body.position:
-        filters["position"] = body.position
-    if body.conference:
-        filters["conference"] = body.conference
-
-    response_data = MarketReportResponse(
-        filters_applied=filters,
-        total_players=500,
-        average_value=185000,
-        median_value=75000,
-        total_market_value=92500000,
-        value_by_tier={
-            "mega": {"count": 15, "avg_value": 1500000},
-            "premium": {"count": 50, "avg_value": 600000},
-            "solid": {"count": 100, "avg_value": 175000},
-            "moderate": {"count": 150, "avg_value": 50000},
-            "entry": {"count": 185, "avg_value": 15000},
-        },
-        top_players=[
-            {"name": "Top QB", "school": "Georgia", "position": "QB", "value": 2500000},
-            {"name": "Star WR", "school": "Ohio State", "position": "WR", "value": 1800000},
-        ],
-        market_trends=[
-            "QB values increased 18% year-over-year",
-            "Social media following driving premium valuations",
-            "Blue blood schools command 2-3x market premium",
-        ],
-    )
-
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode - run generate_nil_valuations.py for real data",
-    )
+    except HTTPException:
+        raise
+    except (R2NotConfiguredError, R2DataLoadError) as e:
+        logger.error(f"R2 error in market report: {e}")
+        raise HTTPException(status_code=503, detail="Data storage unavailable")
+    except Exception as e:
+        logger.error(f"Market report error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Market report failed: {str(e)}")
 
 
 # =============================================================================
@@ -841,17 +899,25 @@ async def portal_active(
             else:
                 player_status = "available"
 
+            origin_school = str(row.get("origin_school", ""))
+            dest_school = str(row.get("destination_school", "")) if pd.notna(row.get("destination_school")) else None
+            nil_val = float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None
+
             player_data = {
                 "player_id": str(row.get("player_id", player_name.replace(" ", "_").lower())),
                 "player_name": player_name,
                 "position": str(row.get("position", "")),
-                "origin_school": str(row.get("origin_school", "")),
+                "origin_school": origin_school,
                 "origin_conference": str(row.get("conference")) if pd.notna(row.get("conference")) else None,
-                "destination_school": str(row.get("destination_school")) if pd.notna(row.get("destination_school")) else None,
+                "destination_school": dest_school,
                 "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
                 "status": player_status,
-                "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                "nil_valuation": nil_val,
+                "nil_tier": str(row.get("nil_tier", "")) if pd.notna(row.get("nil_tier")) else (_get_nil_tier(nil_val) if nil_val else "entry"),
                 "headshot_url": str(row.get("headshot_url")) if pd.notna(row.get("headshot_url")) else None,
+                # School logos
+                "origin_logo": get_team_logo_url(origin_school),
+                "destination_logo": get_team_logo_url(dest_school) if dest_school else None,
                 # Additional fields for detail view
                 "height": float(row.get("height", 0)) if pd.notna(row.get("height")) else None,
                 "weight": float(row.get("weight", 0)) if pd.notna(row.get("weight")) else None,
@@ -949,32 +1015,158 @@ async def flight_risk(
         except Exception as e:
             logger.error(f"Flight risk error: {e}")
 
-    # Demo fallback
-    risk_prob = 0.35
-    if body.team_context and body.team_context.get("recent_coaching_change"):
-        risk_prob += 0.2
+    # Data-driven flight risk calculation
+    risk_prob = 0.20  # Base risk: ~20% of players enter portal each cycle
+    risk_factors = []
+    recommendations = []
+
+    player_name = body.player.name
+    school = body.player.school
+    position = (body.player.position or "").upper()
+    stars = getattr(body.player, "stars", None) or 3
+
+    # Factor 1: School tier (lower tier → higher risk of losing to bigger programs)
+    try:
+        from ..models.school_tiers import get_school_tier
+        tier_name, tier_info = get_school_tier(school)
+        tier_mult = tier_info.get("multiplier", 1.0)
+        # Low-tier schools lose more players
+        if tier_mult <= 0.8:
+            risk_prob += 0.15
+            risk_factors.append({"factor": "school_tier", "impact": 0.15, "detail": f"{school} is {tier_info.get('label', 'lower tier')} — players often seek P4 opportunities"})
+        elif tier_mult <= 1.1:
+            risk_prob += 0.05
+            risk_factors.append({"factor": "school_tier", "impact": 0.05, "detail": f"{school} is mid-tier — some upward portal movement expected"})
+        else:
+            risk_prob -= 0.05  # Blue bloods retain better
+    except Exception:
+        pass
+
+    # Factor 2: Position scarcity — high-demand positions get more offers
+    high_demand = {"QB": 0.10, "EDGE": 0.08, "WR": 0.06, "CB": 0.06, "OT": 0.05}
+    pos_impact = high_demand.get(position, 0.0)
+    if pos_impact > 0:
+        risk_prob += pos_impact
+        risk_factors.append({"factor": "position_demand", "impact": pos_impact, "detail": f"{position} is a high-demand portal position"})
+
+    # Factor 3: Star rating — high-star players get recruited away more
+    if stars >= 4:
+        star_impact = 0.10
+        risk_prob += star_impact
+        risk_factors.append({"factor": "talent_level", "impact": star_impact, "detail": f"{stars}-star talent attracts portal interest from top programs"})
+    elif stars <= 2:
+        risk_prob -= 0.05  # Lower stars, fewer offers
+
+    # Factor 4: NIL value gap — if player's value is below school average, they may seek better NIL
+    try:
+        nil_df = get_nil_players(limit=50000)
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
+        if not nil_df.empty and val_col in nil_df.columns:
+            school_norm = normalize_school_name(school).lower()
+            name_col = "name" if "name" in nil_df.columns else "player_name"
+            school_col = "school" if "school" in nil_df.columns else "team"
+            # Find player's NIL value
+            player_match = nil_df[nil_df[name_col].str.lower() == player_name.lower()]
+            player_nil = float(player_match[val_col].iloc[0]) if not player_match.empty else 0
+            # School average
+            school_players = nil_df[nil_df[school_col].apply(lambda x: normalize_school_name(str(x)).lower()) == school_norm]
+            school_avg = float(school_players[val_col].mean()) if not school_players.empty else 50000
+            if player_nil > 0 and player_nil < school_avg * 0.5:
+                nil_impact = 0.10
+                risk_prob += nil_impact
+                risk_factors.append({"factor": "nil_undervalued", "impact": nil_impact, "detail": f"Player NIL (${player_nil:,.0f}) is below school average (${school_avg:,.0f})"})
+                recommendations.append(f"Increase NIL to at least ${school_avg * 0.7:,.0f} to reduce flight risk")
+            replacement_cost = max(player_nil * 1.2, school_avg)
+        else:
+            replacement_cost = 50000
+    except Exception:
+        replacement_cost = 50000
+
+    # Factor 5: Team context (coaching changes, losing season, etc.)
+    if body.team_context:
+        if body.team_context.get("recent_coaching_change"):
+            risk_prob += 0.20
+            risk_factors.append({"factor": "coaching_change", "impact": 0.20, "detail": "Recent coaching change significantly increases portal risk"})
+            recommendations.append("New coaching staff should meet individually with key players")
+        if body.team_context.get("losing_season"):
+            risk_prob += 0.10
+            risk_factors.append({"factor": "team_performance", "impact": 0.10, "detail": "Losing season increases player dissatisfaction"})
+
+    # Factor 6: Check if similar players at this school have transferred
+    try:
+        portal_df = get_portal_players()
+        if not portal_df.empty:
+            origin_col = "origin_school" if "origin_school" in portal_df.columns else "from_school"
+            if origin_col in portal_df.columns:
+                school_departures = portal_df[portal_df[origin_col].apply(
+                    lambda x: normalize_school_name(str(x)).lower()) == normalize_school_name(school).lower()]
+                if "position" in portal_df.columns:
+                    pos_departures = school_departures[school_departures["position"].str.upper() == position]
+                    if len(pos_departures) >= 2:
+                        risk_prob += 0.08
+                        risk_factors.append({"factor": "position_exodus", "impact": 0.08, "detail": f"{len(pos_departures)} {position}s have already left {school} this cycle"})
+
+                # Find comparable transfers for context
+                comparable_transfers = []
+                pos_transfers = portal_df[portal_df["position"].str.upper() == position] if "position" in portal_df.columns else pd.DataFrame()
+                if not pos_transfers.empty and "stars" in pos_transfers.columns:
+                    similar = pos_transfers[(pos_transfers["stars"] >= stars - 1) & (pos_transfers["stars"] <= stars + 1)]
+                    for _, t in similar.head(3).iterrows():
+                        comparable_transfers.append({
+                            "name": str(t.get("name", "")),
+                            "position": str(t.get("position", "")),
+                            "from_school": str(t.get(origin_col, "")),
+                            "stars": int(t.get("stars", 0)),
+                        })
+    except Exception:
+        comparable_transfers = []
+
+    # Clamp probability
+    risk_prob = max(0.05, min(0.95, risk_prob))
+
+    # Determine risk level
+    if risk_prob >= 0.70:
+        risk_level = "critical"
+    elif risk_prob >= 0.50:
+        risk_level = "high"
+    elif risk_prob >= 0.30:
+        risk_level = "moderate"
+    else:
+        risk_level = "low"
+
+    # Default recommendations
+    if not recommendations:
+        if risk_level in ("critical", "high"):
+            recommendations = [
+                "Schedule immediate meeting to discuss player's role and development plan",
+                f"Review NIL compensation — replacement cost estimated at ${replacement_cost:,.0f}",
+                "Ensure position coach relationship is strong",
+            ]
+        elif risk_level == "moderate":
+            recommendations = [
+                "Maintain regular check-ins on player satisfaction",
+                "Ensure competitive NIL compensation within position group",
+            ]
+        else:
+            recommendations = [
+                "Continue current development plan",
+                "Player appears settled — standard retention practices sufficient",
+            ]
 
     response_data = FlightRiskResponse(
         player_name=body.player.name,
         school=body.player.school,
-        flight_risk_probability=risk_prob,
-        risk_level="moderate" if risk_prob < 0.5 else "high",
-        risk_factors=[
-            {"factor": "playing_time", "impact": 0.15},
-            {"factor": "nil_market", "impact": 0.10},
-        ],
-        retention_recommendations=[
-            "Ensure competitive NIL compensation",
-            "Discuss role in upcoming season",
-        ],
-        estimated_replacement_cost=150000,
-        comparable_transfers=[],
+        flight_risk_probability=round(risk_prob, 3),
+        risk_level=risk_level,
+        risk_factors=risk_factors,
+        retention_recommendations=recommendations,
+        estimated_replacement_cost=round(replacement_cost),
+        comparable_transfers=comparable_transfers if "comparable_transfers" in dir() else [],
     )
 
     return APIResponse(
         status="success",
         data=response_data.model_dump(),
-        message="Demo mode",
     )
 
 
@@ -990,52 +1182,154 @@ async def team_report(
     body: TeamReportRequest,
     api_key: str = Depends(require_api_key),
 ):
-    """Generate team-wide flight risk report."""
-    models = get_models(request)
-    portal_predictor = models.get("portal_predictor")
+    """Generate team-wide flight risk report using real roster and portal data."""
+    school = body.school
+    school_norm = normalize_school_name(school).lower()
 
-    if portal_predictor is not None:
+    try:
+        # Load real data
+        nil_df = get_nil_players(limit=50000)
+        portal_df = get_portal_players()
+
+        # Find school roster players from NIL data
+        name_col = "name" if "name" in nil_df.columns else "player_name"
+        school_col = "school" if "school" in nil_df.columns else "team"
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
+
+        roster_players = nil_df[nil_df[school_col].apply(
+            lambda x: normalize_school_name(str(x)).lower()) == school_norm].copy()
+        total_roster_size = len(roster_players)
+
+        if total_roster_size == 0:
+            raise HTTPException(status_code=404, detail=f"No roster data found for {school}")
+
+        # Get school tier info
         try:
-            # Would need roster data - using placeholder
-            report = portal_predictor.team_flight_risk_report(
-                pd.DataFrame(),  # Would load from database
-                body.school,
-            )
-            if report:
-                return APIResponse(status="success", data=report)
-        except Exception as e:
-            logger.error(f"Team report error: {e}")
+            from ..models.school_tiers import get_school_tier
+            tier_name, tier_info = get_school_tier(school)
+            tier_mult = tier_info.get("multiplier", 1.0)
+        except Exception:
+            tier_mult = 1.0
 
-    # Demo fallback
-    response_data = TeamReportResponse(
-        school=body.school,
-        analysis_date=datetime.utcnow(),
-        total_roster_size=85,
-        total_at_risk=8,
-        critical_risk_players=[
-            {"name": "WR1", "position": "WR", "risk": 0.78, "nil_value": 200000},
-        ],
-        high_risk_players=[
-            {"name": "CB2", "position": "CB", "risk": 0.62, "nil_value": 150000},
-            {"name": "RB1", "position": "RB", "risk": 0.58, "nil_value": 120000},
-        ],
-        estimated_wins_at_risk=1.8,
-        total_retention_budget_needed=850000,
-        position_vulnerability={
-            "WR": {"count": 2, "avg_risk": 0.65},
-            "CB": {"count": 2, "avg_risk": 0.55},
-        },
-        recommendations=[
-            "Prioritize WR retention - highest flight risk position group",
-            "Address CB depth concerns before portal window",
-        ],
-    )
+        # Get players who already left via portal
+        origin_col = "origin_school" if "origin_school" in portal_df.columns else "from_school"
+        departed = portal_df[portal_df[origin_col].apply(
+            lambda x: normalize_school_name(str(x)).lower()) == school_norm] if not portal_df.empty else pd.DataFrame()
+        departed_positions = departed["position"].str.upper().tolist() if "position" in departed.columns else []
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode - provide roster data for full analysis",
-    )
+        # Calculate risk for each roster player
+        high_demand_positions = {"QB": 0.10, "EDGE": 0.08, "WR": 0.06, "CB": 0.06, "OT": 0.05}
+        school_avg_nil = float(roster_players[val_col].mean()) if val_col in roster_players.columns else 50000
+
+        critical_risk = []
+        high_risk = []
+        position_vulnerability = {}
+
+        for _, player in roster_players.iterrows():
+            p_name = str(player.get(name_col, "Unknown"))
+            p_pos = str(player.get("position", "")).upper()
+            p_nil = float(player.get(val_col, 0)) if val_col in player.index else 0
+            p_stars = int(player.get("stars", 3)) if "stars" in player.index else 3
+
+            # Calculate individual risk
+            risk = 0.15  # Base
+            if tier_mult <= 0.8:
+                risk += 0.12
+            elif tier_mult <= 1.1:
+                risk += 0.04
+
+            risk += high_demand_positions.get(p_pos, 0.0)
+
+            if p_stars >= 4:
+                risk += 0.08
+
+            # NIL undervaluation
+            if p_nil > 0 and p_nil < school_avg_nil * 0.4:
+                risk += 0.12
+
+            # Position already hemorrhaging players
+            pos_departed = departed_positions.count(p_pos)
+            if pos_departed >= 2:
+                risk += 0.05  # Position group is unstable
+
+            risk = max(0.05, min(0.95, risk))
+
+            player_entry = {
+                "name": p_name,
+                "position": p_pos,
+                "risk": round(risk, 3),
+                "nil_value": round(p_nil),
+            }
+
+            if risk >= 0.55:
+                critical_risk.append(player_entry)
+            elif risk >= 0.35:
+                high_risk.append(player_entry)
+
+            # Track position vulnerability
+            if p_pos not in position_vulnerability:
+                position_vulnerability[p_pos] = {"count": 0, "total_risk": 0}
+            if risk >= 0.30:
+                position_vulnerability[p_pos]["count"] += 1
+                position_vulnerability[p_pos]["total_risk"] += risk
+
+        # Sort by risk
+        critical_risk.sort(key=lambda x: x["risk"], reverse=True)
+        high_risk.sort(key=lambda x: x["risk"], reverse=True)
+
+        # Finalize position vulnerability
+        pos_vuln_final = {}
+        for pos, data in position_vulnerability.items():
+            if data["count"] > 0:
+                pos_vuln_final[pos] = {
+                    "count": data["count"],
+                    "avg_risk": round(data["total_risk"] / data["count"], 3),
+                }
+
+        total_at_risk = len(critical_risk) + len(high_risk)
+
+        # Estimate WAR at risk
+        war_at_risk = sum(
+            calculate_player_war(p["position"], p.get("stars", 3) if "stars" in p else 3, p["nil_value"], school)
+            for p in critical_risk
+        )
+
+        # Retention budget = sum of NIL values for at-risk players * 1.3 (raise needed)
+        retention_budget = sum(p["nil_value"] for p in critical_risk + high_risk) * 1.3
+
+        # Build recommendations
+        recommendations = []
+        if critical_risk:
+            top_pos = critical_risk[0]["position"]
+            recommendations.append(f"Immediate retention priority: {critical_risk[0]['name']} ({top_pos}) — highest flight risk")
+        vulnerable_positions = sorted(pos_vuln_final.items(), key=lambda x: x[1]["avg_risk"], reverse=True)
+        for pos, data in vulnerable_positions[:2]:
+            recommendations.append(f"Address {pos} depth — {data['count']} players at elevated risk (avg {data['avg_risk']:.0%})")
+        if departed_positions:
+            recommendations.append(f"Already lost {len(departed_positions)} players to portal this cycle — monitor remaining roster closely")
+
+        response_data = TeamReportResponse(
+            school=school,
+            analysis_date=datetime.utcnow(),
+            total_roster_size=total_roster_size,
+            total_at_risk=total_at_risk,
+            critical_risk_players=critical_risk[:10],
+            high_risk_players=high_risk[:10],
+            estimated_wins_at_risk=round(war_at_risk, 1),
+            total_retention_budget_needed=round(retention_budget),
+            position_vulnerability=pos_vuln_final,
+            recommendations=recommendations,
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Team report error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Team report failed: {str(e)}")
 
 
 @router.post(
@@ -1083,29 +1377,138 @@ async def portal_fit(
         except Exception as e:
             logger.error(f"Portal fit error: {e}")
 
-    # Demo fallback
-    fit_score = 0.75
+    # Data-driven fit calculation using real roster, PFF, and NIL data
+    position = player_dict.get("position", "").upper()
+    stars = player_dict.get("stars") or player_dict.get("overall_rating", 0.75) * 5
+    if isinstance(stars, float) and stars <= 1.0:
+        stars = round(stars * 5)
+    player_nil = player_dict.get("nil_value", 0) or _calculate_demo_nil_value(player_dict)
+
+    # 1. Position need at target school (35% weight)
+    try:
+        roster = get_team_roster_composition(body.target_school)
+        pos_count = roster.get(position, 0)
+        ideal = IDEAL_ROSTER.get(position, 3)
+        # Account for outgoing players at that position
+        portal_df = get_portal_players()
+        outgoing_at_pos = 0
+        if not portal_df.empty:
+            origin_col = "origin_school" if "origin_school" in portal_df.columns else None
+            if origin_col:
+                portal_df["_origin_norm"] = portal_df[origin_col].apply(normalize_school_name).str.lower()
+                target_norm = normalize_school_name(body.target_school).lower()
+                team_outgoing = portal_df[portal_df["_origin_norm"] == target_norm]
+                if "position" in team_outgoing.columns:
+                    outgoing_at_pos = len(team_outgoing[team_outgoing["position"].str.upper() == position])
+        adjusted = pos_count - outgoing_at_pos
+        need_ratio = max(0.0, min(1.0, (ideal - adjusted) / max(ideal, 1)))
+    except Exception:
+        need_ratio = 0.5
+
+    # 2. School tier compatibility (25% weight)
+    target_mult = _get_school_multiplier(body.target_school)
+    origin_mult = _get_school_multiplier(body.player.school)
+    # Higher fit when player's tier matches target's tier
+    tier_gap = abs(target_mult - origin_mult) / max(target_mult, origin_mult, 1)
+    tier_fit = max(0.3, 1.0 - tier_gap * 0.5)
+
+    # 3. Performance fit via PFF (20% weight)
+    try:
+        team_pff = get_team_pff_summary(body.target_school)
+        player_pff_data = get_player_pff_stats(body.player.name)
+        if player_pff_data and team_pff.get("avg_overall", 0) > 0:
+            player_grade = player_pff_data.get("pff_overall", 65)
+            pff_fit = min(1.0, player_grade / max(team_pff["avg_overall"], 50))
+        else:
+            # Estimate from stars
+            estimated_grade = 50 + (float(stars) * 6)
+            team_avg = team_pff.get("avg_overall", 65) if team_pff else 65
+            pff_fit = min(1.0, estimated_grade / max(team_avg, 50))
+    except Exception:
+        pff_fit = 0.65
+
+    # 4. NIL capacity fit (20% weight)
+    try:
+        nil_players = get_nil_players(school=body.target_school, limit=100)
+        if not nil_players.empty and "nil_value" in nil_players.columns:
+            team_avg_nil = nil_players["nil_value"].mean()
+            nil_ratio = player_nil / max(team_avg_nil, 5000)
+            nil_fit = 1.0 if nil_ratio <= 1.5 else max(0.4, 1.0 - (nil_ratio - 1.5) * 0.2)
+        else:
+            nil_fit = 0.7
+    except Exception:
+        nil_fit = 0.7
+
+    # Weighted composite fit score
+    fit_score = (need_ratio * 0.35 + tier_fit * 0.25 + pff_fit * 0.20 + nil_fit * 0.20)
+    fit_score = max(0.1, min(1.0, fit_score))
+
+    # Grade from fit score
+    if fit_score >= 0.85:
+        fit_grade = "A+"
+    elif fit_score >= 0.75:
+        fit_grade = "A"
+    elif fit_score >= 0.65:
+        fit_grade = "B+"
+    elif fit_score >= 0.55:
+        fit_grade = "B"
+    elif fit_score >= 0.45:
+        fit_grade = "C+"
+    else:
+        fit_grade = "C"
+
+    # Projected NIL at target (scale by school multiplier ratio)
+    projected_nil = player_nil * (target_mult / max(origin_mult, 0.5))
+
+    # Projected playing time based on fit
+    if fit_score >= 0.7 and need_ratio >= 0.5:
+        playing_time = "Day 1 Starter"
+    elif fit_score >= 0.5:
+        playing_time = "Starter"
+    elif fit_score >= 0.35:
+        playing_time = "Rotational"
+    else:
+        playing_time = "Depth"
+
+    # Build concerns and strengths
+    concerns = []
+    strengths = []
+    if tier_gap > 0.4:
+        concerns.append("Significant program tier gap")
+    if need_ratio < 0.2:
+        concerns.append(f"Limited snaps available at {position}")
+    if nil_fit < 0.5:
+        concerns.append("NIL expectations may exceed team budget")
+    if need_ratio >= 0.5:
+        strengths.append(f"Fills critical {position} need")
+    if tier_fit >= 0.8:
+        strengths.append("Strong program tier match")
+    if pff_fit >= 0.8:
+        strengths.append("Above-average production for this roster")
+    if not strengths:
+        strengths.append("Solid portal addition")
+
     response_data = PortalFitResponse(
         player_name=body.player.name,
         origin_school=body.player.school,
         target_school=body.target_school,
-        fit_score=fit_score,
-        fit_grade="B+" if fit_score >= 0.75 else "B",
+        fit_score=round(fit_score, 3),
+        fit_grade=fit_grade,
         fit_breakdown={
-            "scheme_fit": 0.80,
-            "competition_level": 0.70,
-            "geographic_fit": 0.75,
+            "position_need": round(need_ratio, 3),
+            "tier_fit": round(tier_fit, 3),
+            "performance_fit": round(pff_fit, 3),
+            "nil_fit": round(nil_fit, 3),
         },
-        projected_nil_at_target=_calculate_demo_nil_value(player_dict) * _get_school_multiplier(body.target_school),
-        projected_playing_time="Starter",
-        concerns=["Adjustment to new system"],
-        strengths=["Experience level", "Production history"],
+        projected_nil_at_target=round(projected_nil, 0),
+        projected_playing_time=playing_time,
+        concerns=concerns,
+        strengths=strengths,
     )
 
     return APIResponse(
         status="success",
         data=response_data.model_dump(),
-        message="Demo mode",
     )
 
 
@@ -1149,36 +1552,114 @@ async def portal_recommendations(
         except Exception as e:
             logger.error(f"Portal recommendations error: {e}")
 
-    # Demo fallback
-    positions = body.positions_of_need or ["QB", "EDGE", "CB"]
+    # Data-driven recommendations from real portal data
+    try:
+        portal_df = get_portal_players()
+        if portal_df.empty:
+            raise HTTPException(status_code=503, detail="Portal data unavailable")
 
-    demo_targets = []
-    for i, pos in enumerate(positions[:5]):
-        demo_targets.append({
-            "name": f"Portal Target {i+1}",
-            "position": pos,
-            "origin_school": "Previous School",
-            "projected_nil": body.budget * (0.3 - i * 0.05),
-            "fit_score": 0.85 - i * 0.05,
-            "win_impact": 0.8 - i * 0.1,
-            "value_rating": 0.9 - i * 0.1,
-        })
+        school_norm = normalize_school_name(body.school).lower()
 
-    response_data = PortalRecommendationsResponse(
-        school=body.school,
-        budget=body.budget,
-        targets=demo_targets,
-        positions_prioritized=positions,
-        budget_allocation_suggestion={pos: body.budget / len(positions) for pos in positions},
-        projected_roster_improvement=1.5,
-        acquisition_strategy="Focus on elite talent at positions of need",
-    )
+        # Get roster needs to determine priority positions
+        needs = get_roster_needs(body.school, portal_df)
+        priority_positions = needs.get("priority_positions", [])
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode",
-    )
+        # Use provided positions or fall back to calculated needs
+        target_positions = body.positions_of_need or priority_positions or ["QB", "WR", "EDGE", "CB"]
+
+        # Filter available portal players
+        status_col = "status" if "status" in portal_df.columns else None
+        if status_col:
+            available = portal_df[portal_df[status_col].fillna("").str.lower() == "available"].copy()
+        else:
+            available = portal_df.copy()
+
+        # Filter by target positions
+        if "position" in available.columns and target_positions:
+            pos_upper = [p.upper() for p in target_positions]
+            available = available[available["position"].str.upper().isin(pos_upper)]
+
+        if available.empty:
+            # Broaden search if no matches
+            available = portal_df.copy()
+            if status_col:
+                available = available[available[status_col].fillna("").str.lower() == "available"]
+
+        # Get NIL values and calculate WAR for each
+        val_col = "nil_value" if "nil_value" in available.columns else "nil_valuation"
+        targets = []
+        for _, player in available.iterrows():
+            p_name = str(player.get("name", "Unknown"))
+            p_pos = str(player.get("position", "")).upper()
+            p_nil = float(player.get(val_col, 0)) if val_col in player.index and pd.notna(player.get(val_col)) else 0
+            p_stars = int(player.get("stars", 3)) if "stars" in player.index and pd.notna(player.get("stars")) else 3
+            origin_col = "origin_school" if "origin_school" in player.index else "from_school"
+            p_origin = str(player.get(origin_col, ""))
+
+            # Skip if over budget
+            if p_nil > body.budget * 0.5:
+                continue
+
+            war = calculate_player_war(p_pos, p_stars, p_nil, body.school)
+
+            # Fit score: position need + talent level
+            pos_need_boost = 1.2 if p_pos in target_positions else 0.8
+            fit = min(1.0, (war / 3.0) * pos_need_boost)
+            value_rating = min(1.0, war / max(p_nil / 100000, 0.5))  # WAR per $100K
+
+            targets.append({
+                "name": p_name,
+                "position": p_pos,
+                "origin_school": normalize_school_name(p_origin),
+                "stars": p_stars,
+                "projected_nil": round(p_nil),
+                "fit_score": round(fit, 3),
+                "win_impact": round(war, 2),
+                "value_rating": round(min(1.0, value_rating), 3),
+            })
+
+        # Sort by fit_score * win_impact for best overall targets
+        targets.sort(key=lambda x: x["fit_score"] * x["win_impact"], reverse=True)
+        targets = targets[:body.max_targets]
+
+        # Budget allocation by position
+        budget_allocation = {}
+        total_projected = sum(t["projected_nil"] for t in targets)
+        for pos in target_positions:
+            pos_targets = [t for t in targets if t["position"] == pos]
+            pos_nil = sum(t["projected_nil"] for t in pos_targets)
+            budget_allocation[pos] = round(pos_nil)
+
+        # Projected WAR improvement
+        total_war = sum(t["win_impact"] for t in targets)
+
+        # Strategy text
+        if total_war >= 5:
+            strategy = f"Aggressive portal strategy: {len(targets)} targets adding {total_war:.1f} projected WAR"
+        elif total_war >= 2:
+            strategy = f"Targeted portal additions: {len(targets)} players filling key gaps, {total_war:.1f} WAR"
+        else:
+            strategy = f"Selective portal approach: focus on highest-impact {target_positions[0]} targets"
+
+        response_data = PortalRecommendationsResponse(
+            school=body.school,
+            budget=body.budget,
+            targets=targets,
+            positions_prioritized=target_positions,
+            budget_allocation_suggestion=budget_allocation,
+            projected_roster_improvement=round(total_war, 1),
+            acquisition_strategy=strategy,
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Portal recommendations error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Recommendations failed: {str(e)}")
 
 
 @router.get(
@@ -1207,9 +1688,9 @@ async def portal_rankings(
         status_col = "status" if "status" in df.columns else None
         if status_col:
             status_lower = df[status_col].fillna("").str.lower()
-            committed_df = df[status_lower == "committed"]
+            committed_df = df[status_lower == "committed"].copy()
         else:
-            committed_df = df
+            committed_df = df.copy()
 
         # Find destination column
         dest_col = None
@@ -1224,79 +1705,130 @@ async def portal_rankings(
                 data={"rankings": [], "total_teams": 0}
             )
 
-        # Group by destination school
+        # Normalize school names for proper matching
+        committed_df["_dest_normalized"] = committed_df[dest_col].apply(normalize_school_name)
+
+        # Load On3 team portal rankings for comparison
+        try:
+            on3_rankings_df = get_on3_team_portal_rankings()
+            on3_lookup = {}
+            if not on3_rankings_df.empty:
+                for _, row in on3_rankings_df.iterrows():
+                    team_name = normalize_school_name(str(row.get("team", row.get("school", ""))))
+                    on3_lookup[team_name.lower()] = {
+                        "rank": int(row.get("overall_rank", 0)) if pd.notna(row.get("overall_rank")) else None,
+                        "score": float(row.get("overall_score", 0)) if pd.notna(row.get("overall_score")) else None,
+                    }
+        except Exception:
+            on3_lookup = {}
+
+        # Group by normalized destination school
         rankings = []
-        grouped = committed_df.groupby(dest_col)
+        grouped = committed_df.groupby("_dest_normalized")
 
         for team, group in grouped:
             if pd.isna(team) or str(team).strip() == "":
                 continue
 
+            team_str = str(team)
             transfers_in = len(group)
             total_stars = group["stars"].sum() if "stars" in group.columns else 0
             avg_stars = group["stars"].mean() if "stars" in group.columns and transfers_in > 0 else 0
             total_nil = group["nil_value"].sum() if "nil_value" in group.columns else 0
 
-            # Calculate portal score (weighted combination)
+            # Calculate real WAR for each player
+            war_added = 0.0
+            for _, player in group.iterrows():
+                pos = str(player.get("position", "")) or ""
+                stars = player.get("stars", 0)
+                nil_val = player.get("nil_value", 0)
+                war_added += calculate_player_war(pos, stars, nil_val if pd.notna(nil_val) else 0, team_str)
+
+            # Multi-factor portal score
+            # WAR score (40% weight) - normalize to 0-100 scale
+            war_score = min(war_added / 15.0, 1.0) * 100
+
+            # NIL score (15% weight) - log scale normalized
+            nil_total = float(total_nil) if pd.notna(total_nil) else 0
+            nil_score = math.log1p(nil_total) / math.log1p(5_000_000) * 100
+
+            # Talent score (20% weight) - avg stars normalized
+            avg_stars_val = float(avg_stars) if pd.notna(avg_stars) else 0
+            talent_score = (avg_stars_val / 5.0) * 100
+
+            # Volume score (10% weight) - more transfers = better, cap at 20
+            volume_score = min(transfers_in / 20.0, 1.0) * 100
+
+            # Position diversity score (15% weight)
+            if "position" in group.columns:
+                unique_positions = group["position"].dropna().nunique()
+                balance_score = min(unique_positions / min(transfers_in, 8), 1.0) * 100
+            else:
+                balance_score = 50.0
+
             portal_score = (
-                transfers_in * 10 +
-                total_stars * 5 +
-                (avg_stars * 20) +
-                (total_nil / 50000)
+                war_score * 0.40 +
+                nil_score * 0.15 +
+                talent_score * 0.20 +
+                volume_score * 0.10 +
+                balance_score * 0.15
             )
 
-            # WAR estimate (0.3 per star, 0.5 for 4+ stars)
-            war_added = 0
-            if "stars" in group.columns:
-                for _, player in group.iterrows():
-                    stars = player.get("stars", 0) or 0
-                    if stars >= 4:
-                        war_added += 0.5
-                    elif stars >= 3:
-                        war_added += 0.3
-                    else:
-                        war_added += 0.1
-
-            # Grade based on portal score
-            if portal_score >= 200:
+            # Grade thresholds calibrated for realistic distribution
+            if portal_score >= 85:
                 grade = "A+"
-            elif portal_score >= 150:
+            elif portal_score >= 70:
                 grade = "A"
-            elif portal_score >= 100:
+            elif portal_score >= 55:
                 grade = "B+"
-            elif portal_score >= 75:
+            elif portal_score >= 40:
                 grade = "B"
-            elif portal_score >= 50:
+            elif portal_score >= 25:
                 grade = "C+"
-            else:
+            elif portal_score >= 15:
                 grade = "C"
-
-            # Top acquisitions
-            top_acquisitions = []
-            if "stars" in group.columns:
-                sorted_group = group.sort_values("stars", ascending=False).head(3)
             else:
-                sorted_group = group.head(3)
+                grade = "D"
 
-            for _, player in sorted_group.iterrows():
-                top_acquisitions.append({
+            # Top acquisitions (sorted by WAR contribution)
+            top_acquisitions = []
+            acq_list = []
+            for _, player in group.iterrows():
+                pos = str(player.get("position", "")) or ""
+                stars_val = player.get("stars", 0)
+                nil_val = player.get("nil_value", 0)
+                p_war = calculate_player_war(pos, stars_val, nil_val if pd.notna(nil_val) else 0, team_str)
+                acq_list.append({
                     "name": str(player.get("name", "Unknown")),
-                    "position": str(player.get("position", "")),
-                    "stars": int(player.get("stars", 0)) if pd.notna(player.get("stars")) else 0,
-                    "nil_value": float(player.get("nil_value", 0)) if pd.notna(player.get("nil_value")) else 0,
+                    "position": pos,
+                    "stars": int(stars_val) if pd.notna(stars_val) else 0,
+                    "nil_value": float(nil_val) if pd.notna(nil_val) else 0,
+                    "war": round(p_war, 2),
                 })
+            acq_list.sort(key=lambda x: x["war"], reverse=True)
+            top_acquisitions = acq_list[:5]
+
+            # On3 comparison
+            on3_info = on3_lookup.get(team_str.lower(), {})
 
             rankings.append({
-                "team": str(team),
+                "team": team_str,
+                "team_logo": get_team_logo_url(team_str),
                 "grade": grade,
                 "portal_score": round(portal_score, 1),
                 "war_added": round(war_added, 2),
-                "total_nil_invested": round(total_nil, 0),
+                "total_nil_invested": round(nil_total, 0),
                 "breakdown": {
                     "transfers_in": transfers_in,
                     "total_stars": int(total_stars) if pd.notna(total_stars) else 0,
-                    "avg_stars": round(avg_stars, 1) if pd.notna(avg_stars) else 0,
+                    "avg_stars": round(avg_stars_val, 1),
+                    "war_score": round(war_score, 1),
+                    "nil_score": round(nil_score, 1),
+                    "talent_score": round(talent_score, 1),
+                    "balance_score": round(balance_score, 1),
                 },
+                "on3_rank": on3_info.get("rank"),
+                "on3_score": on3_info.get("score"),
                 "top_acquisitions": top_acquisitions,
             })
 
@@ -1343,10 +1875,12 @@ async def portal_team_activity(
                     "incoming": [],
                     "outgoing": [],
                     "net_talent_change": 0,
+                    "summary": {"incoming_count": 0, "outgoing_count": 0, "net_count": 0,
+                                "incoming_war": 0, "outgoing_war": 0, "net_war": 0},
                 }
             )
 
-        team_lower = team.lower()
+        team_normalized = normalize_school_name(team).lower()
 
         # Find column names
         origin_col = None
@@ -1360,42 +1894,72 @@ async def portal_team_activity(
                 dest_col = col
                 break
 
+        # Normalize school names in the data for matching
+        if origin_col:
+            df["_origin_norm"] = df[origin_col].apply(normalize_school_name).str.lower()
+        if dest_col:
+            df["_dest_norm"] = df[dest_col].apply(normalize_school_name).str.lower()
+
         # Outgoing - players who left this team
         outgoing = []
+        outgoing_war_total = 0.0
         if origin_col:
-            outgoing_df = df[df[origin_col].fillna("").str.lower() == team_lower]
+            outgoing_df = df[df["_origin_norm"] == team_normalized]
             for _, row in outgoing_df.iterrows():
+                pos = str(row.get("position", "")) or ""
+                stars = row.get("stars", 0)
+                nil_val = row.get("nil_value", 0)
+                p_war = calculate_player_war(pos, stars, nil_val if pd.notna(nil_val) else 0, team)
+                outgoing_war_total += p_war
                 outgoing.append({
                     "player_id": str(row.get("player_id", "")),
                     "player_name": str(row.get("name", "Unknown")),
-                    "position": str(row.get("position", "")),
-                    "origin_school": str(row.get(origin_col, "")),
-                    "destination_school": str(row.get(dest_col, "")) if dest_col and pd.notna(row.get(dest_col)) else None,
-                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                    "position": pos,
+                    "origin_school": normalize_school_name(str(row.get(origin_col, ""))),
+                    "destination_school": normalize_school_name(str(row.get(dest_col, ""))) if dest_col and pd.notna(row.get(dest_col)) else None,
+                    "stars": int(stars) if pd.notna(stars) else None,
                     "status": str(row.get("status", "available")).lower(),
-                    "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                    "nil_valuation": float(nil_val) if pd.notna(nil_val) else None,
+                    "war": round(p_war, 2),
                 })
 
         # Incoming - players who committed to this team
         incoming = []
+        incoming_war_total = 0.0
+        incoming_nil_total = 0.0
         if dest_col:
-            incoming_df = df[df[dest_col].fillna("").str.lower() == team_lower]
+            incoming_df = df[df["_dest_norm"] == team_normalized]
             for _, row in incoming_df.iterrows():
+                pos = str(row.get("position", "")) or ""
+                stars = row.get("stars", 0)
+                nil_val = row.get("nil_value", 0)
+                nil_float = float(nil_val) if pd.notna(nil_val) else 0
+                p_war = calculate_player_war(pos, stars, nil_float, team)
+                incoming_war_total += p_war
+                incoming_nil_total += nil_float
                 incoming.append({
                     "player_id": str(row.get("player_id", "")),
                     "player_name": str(row.get("name", "Unknown")),
-                    "position": str(row.get("position", "")),
-                    "origin_school": str(row.get(origin_col, "")) if origin_col else "",
-                    "destination_school": str(row.get(dest_col, "")),
-                    "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else None,
+                    "position": pos,
+                    "origin_school": normalize_school_name(str(row.get(origin_col, ""))) if origin_col else "",
+                    "destination_school": normalize_school_name(str(row.get(dest_col, ""))),
+                    "stars": int(stars) if pd.notna(stars) else None,
                     "status": "committed",
-                    "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else None,
+                    "nil_valuation": nil_float,
+                    "war": round(p_war, 2),
                 })
 
-        # Calculate net talent change (incoming stars - outgoing stars)
-        incoming_stars = sum(p.get("stars", 0) or 0 for p in incoming)
-        outgoing_stars = sum(p.get("stars", 0) or 0 for p in outgoing)
-        net_talent_change = incoming_stars - outgoing_stars
+        # Sort by WAR
+        incoming.sort(key=lambda x: x.get("war", 0), reverse=True)
+        outgoing.sort(key=lambda x: x.get("war", 0), reverse=True)
+
+        # Calculate roster needs from portal activity
+        try:
+            roster_needs = get_roster_needs(team, incoming, outgoing)
+        except Exception:
+            roster_needs = None
+
+        net_war = incoming_war_total - outgoing_war_total
 
         return APIResponse(
             status="success",
@@ -1404,7 +1968,18 @@ async def portal_team_activity(
                 "season": season,
                 "incoming": incoming,
                 "outgoing": outgoing,
-                "net_talent_change": net_talent_change,
+                "net_talent_change": sum(p.get("stars", 0) or 0 for p in incoming) - sum(p.get("stars", 0) or 0 for p in outgoing),
+                "net_war": round(net_war, 2),
+                "total_nil_invested": round(incoming_nil_total, 0),
+                "summary": {
+                    "incoming_count": len(incoming),
+                    "outgoing_count": len(outgoing),
+                    "net_count": len(incoming) - len(outgoing),
+                    "incoming_war": round(incoming_war_total, 2),
+                    "outgoing_war": round(outgoing_war_total, 2),
+                    "net_war": round(net_war, 2),
+                },
+                "roster_needs": roster_needs,
             }
         )
 
@@ -1413,6 +1988,137 @@ async def portal_team_activity(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to get team activity: {str(e)}")
+
+
+@router.get(
+    "/roster/{team}/needs",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Team roster needs",
+    description="Get position-by-position roster needs analysis for a team.",
+)
+async def team_roster_needs(
+    request: Request,
+    team: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get roster needs analysis for a team based on current roster and portal activity."""
+    try:
+        # Get portal data for incoming/outgoing
+        df = get_portal_players()
+        incoming_players = []
+        outgoing_players = []
+
+        if not df.empty:
+            origin_col = None
+            dest_col = None
+            for col in ["origin_school", "origin", "from_school", "school"]:
+                if col in df.columns:
+                    origin_col = col
+                    break
+            for col in ["destination_school", "destination", "new_school", "committed_school"]:
+                if col in df.columns:
+                    dest_col = col
+                    break
+
+            team_normalized = normalize_school_name(team).lower()
+
+            if origin_col:
+                df["_origin_norm"] = df[origin_col].apply(normalize_school_name).str.lower()
+                outgoing_df = df[df["_origin_norm"] == team_normalized]
+                for _, row in outgoing_df.iterrows():
+                    outgoing_players.append({
+                        "position": str(row.get("position", "")),
+                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0,
+                    })
+
+            if dest_col:
+                df["_dest_norm"] = df[dest_col].apply(normalize_school_name).str.lower()
+                committed = df[df["_dest_norm"] == team_normalized]
+                if "status" in df.columns:
+                    committed = committed[committed["status"].fillna("").str.lower() == "committed"]
+                for _, row in committed.iterrows():
+                    incoming_players.append({
+                        "position": str(row.get("position", "")),
+                        "stars": int(row.get("stars", 0)) if pd.notna(row.get("stars")) else 0,
+                    })
+
+        # Calculate roster needs
+        needs_data = get_roster_needs(team, incoming_players, outgoing_players)
+
+        # Build analysis text
+        priority = needs_data.get("priority_positions", [])
+        if priority:
+            analysis = f"Priority needs at {team}: {', '.join(priority)}. "
+            for pos in priority[:3]:
+                pos_need = needs_data["needs"].get(pos, {})
+                net = pos_need.get("net", 0)
+                if net < 0:
+                    analysis += f"Lost {abs(net)} {pos}{'s' if abs(net) > 1 else ''} to portal. "
+                elif pos_need.get("need_level") == "critical":
+                    analysis += f"{pos} depth is below ideal roster size. "
+        else:
+            analysis = f"{team} has no critical roster needs currently."
+
+        return APIResponse(
+            status="success",
+            data={
+                "team": team,
+                "needs": needs_data.get("needs", {}),
+                "priority_positions": priority,
+                "analysis": analysis,
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Roster needs error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to calculate roster needs: {str(e)}")
+
+
+@router.get(
+    "/teams/logo/{team}",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Get team logo URL",
+    description="Get ESPN team logo URL for a specific school.",
+)
+async def team_logo(
+    team: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get team logo URL from ESPN CDN."""
+    logo_url = get_team_logo_url(team)
+    return APIResponse(
+        status="success",
+        data={
+            "team": team,
+            "logo_url": logo_url,
+        }
+    )
+
+
+@router.get(
+    "/teams/logos",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Get all team logos",
+    description="Get ESPN team logo URLs for all FBS schools.",
+)
+async def all_team_logos(
+    api_key: str = Depends(require_api_key),
+):
+    """Get all available team logo URLs."""
+    from ..utils.data_loader import get_all_team_logos
+    logos = get_all_team_logos()
+    return APIResponse(
+        status="success",
+        data={
+            "logos": logos,
+            "count": len(logos),
+        }
+    )
 
 
 # =============================================================================
@@ -1465,35 +2171,141 @@ async def draft_project(
         except Exception as e:
             logger.error(f"Draft projection error: {e}")
 
-    # Demo fallback
-    draft_prob = 0.4
-    if player_dict.get("overall_rating", 0.75) >= 0.90:
-        draft_prob = 0.85
-    elif player_dict.get("overall_rating", 0.75) >= 0.85:
-        draft_prob = 0.6
+    # Data-driven draft projection from real player data
+    try:
+        nil_df = get_nil_players(limit=50000)
+        name_col = "name" if "name" in nil_df.columns else "player_name"
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
+        player_name_lower = body.player.name.lower()
+        position = (body.player.position or "").upper()
 
-    response_data = DraftProjectResponse(
-        player_name=body.player.name,
-        position=body.player.position,
-        draft_eligible=body.player.class_year in ["Junior", "Senior"],
-        projected_round=3 if draft_prob > 0.5 else None,
-        projected_pick_range="65-100" if draft_prob > 0.5 else None,
-        draft_probability=draft_prob,
-        draft_grade="B" if draft_prob > 0.5 else "C",
-        expected_draft_value=500 if draft_prob > 0.5 else 100,
-        rookie_contract_estimate=5000000 if draft_prob > 0.5 else 0,
-        career_earnings_estimate=25000000 if draft_prob > 0.5 else 0,
-        strengths=["Production", "Experience"],
-        weaknesses=["Athleticism testing needed"],
-        comparable_prospects=[],
-        stock_trend="stable",
-    )
+        # Find player in data
+        player_match = nil_df[nil_df[name_col].str.lower() == player_name_lower] if not nil_df.empty else pd.DataFrame()
+        if player_match.empty and not nil_df.empty:
+            player_match = nil_df[nil_df[name_col].str.contains(body.player.name, case=False, na=False)]
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode",
-    )
+        stars = int(player_dict.get("stars", 3))
+        nil_value = 0
+        pff_grade = 0
+        school = body.player.school or ""
+
+        if not player_match.empty:
+            row = player_match.iloc[0]
+            stars = int(row.get("stars", stars)) if pd.notna(row.get("stars")) else stars
+            nil_value = float(row.get(val_col, 0)) if pd.notna(row.get(val_col)) else 0
+            pff_grade = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
+            school = str(row.get("school", school)) if pd.notna(row.get("school")) else school
+
+        # Draft probability model using stars + PFF + NIL + position
+        position_draft_rates = {
+            "QB": 0.12, "WR": 0.08, "RB": 0.06, "TE": 0.05, "OT": 0.07,
+            "OG": 0.04, "C": 0.03, "EDGE": 0.09, "DT": 0.05, "LB": 0.06,
+            "CB": 0.08, "S": 0.05, "K": 0.01, "P": 0.01,
+        }
+        base_prob = position_draft_rates.get(position, 0.04)
+
+        # Stars multiplier
+        star_mult = {5: 6.0, 4: 3.5, 3: 1.5, 2: 0.5, 1: 0.2}
+        draft_prob = base_prob * star_mult.get(stars, 1.0)
+
+        # PFF boost
+        if pff_grade >= 85:
+            draft_prob *= 2.0
+        elif pff_grade >= 75:
+            draft_prob *= 1.5
+        elif pff_grade >= 65:
+            draft_prob *= 1.2
+
+        # NIL indicates market perception
+        if nil_value >= 500000:
+            draft_prob *= 1.5
+        elif nil_value >= 100000:
+            draft_prob *= 1.2
+
+        draft_prob = min(0.95, draft_prob)
+
+        # Project round based on probability
+        if draft_prob >= 0.80:
+            projected_round = 1
+            pick_range = "1-32"
+            grade = "A+"
+            contract_est = 20000000
+            career_est = 100000000
+        elif draft_prob >= 0.60:
+            projected_round = 2
+            pick_range = "33-64"
+            grade = "A"
+            contract_est = 10000000
+            career_est = 50000000
+        elif draft_prob >= 0.40:
+            projected_round = 3
+            pick_range = "65-100"
+            grade = "B+"
+            contract_est = 5000000
+            career_est = 25000000
+        elif draft_prob >= 0.25:
+            projected_round = 4
+            pick_range = "101-140"
+            grade = "B"
+            contract_est = 4000000
+            career_est = 15000000
+        elif draft_prob >= 0.15:
+            projected_round = 5
+            pick_range = "141-180"
+            grade = "C+"
+            contract_est = 3500000
+            career_est = 8000000
+        else:
+            projected_round = None
+            pick_range = None
+            grade = "C"
+            contract_est = 2800000  # UDFA
+            career_est = 4000000
+
+        # Strengths/weaknesses from data
+        strengths = []
+        weaknesses = []
+        if pff_grade >= 75:
+            strengths.append(f"Strong PFF grade ({pff_grade:.1f})")
+        if stars >= 4:
+            strengths.append(f"{stars}-star recruit — elite pedigree")
+        if nil_value >= 200000:
+            strengths.append("High market value indicates strong production/brand")
+        if not strengths:
+            strengths.append("Solid production at position")
+
+        if pff_grade > 0 and pff_grade < 65:
+            weaknesses.append(f"Below-average PFF grade ({pff_grade:.1f})")
+        if stars <= 2:
+            weaknesses.append("Low recruiting ranking — must prove at combine")
+        if not weaknesses:
+            weaknesses.append("Needs strong pro day/combine numbers")
+
+        # Stock trend
+        stock_trend = "rising" if draft_prob >= 0.5 and pff_grade >= 70 else "stable" if draft_prob >= 0.25 else "falling"
+
+        response_data = DraftProjectResponse(
+            player_name=body.player.name,
+            position=body.player.position,
+            draft_eligible=body.player.class_year in ["Junior", "Senior", "Redshirt Junior", "Redshirt Senior"],
+            projected_round=projected_round,
+            projected_pick_range=pick_range,
+            draft_probability=round(draft_prob, 3),
+            draft_grade=grade,
+            expected_draft_value=projected_round * 100 if projected_round else 50,
+            rookie_contract_estimate=contract_est,
+            career_earnings_estimate=career_est,
+            strengths=strengths,
+            weaknesses=weaknesses,
+            comparable_prospects=[],
+            stock_trend=stock_trend,
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except Exception as e:
+        logger.error(f"Draft projection fallback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Draft projection failed: {str(e)}")
 
 
 @router.post(
@@ -1534,37 +2346,114 @@ async def mock_draft(
         except Exception as e:
             logger.error(f"Mock draft error: {e}")
 
-    # Demo fallback
-    picks_per_round = 32
-    total_picks = body.num_rounds * picks_per_round
+    # Data-driven mock draft from real player data
+    try:
+        nil_df = get_nil_players(limit=50000)
+        if nil_df.empty:
+            raise HTTPException(status_code=503, detail="Player data unavailable")
 
-    demo_board = []
-    positions = ["QB", "WR", "CB", "EDGE", "OT", "DT", "LB", "S", "RB", "TE"]
-    for i in range(min(total_picks, 50)):  # Limit demo to 50 picks
-        demo_board.append({
-            "pick": i + 1,
-            "round": (i // picks_per_round) + 1,
-            "player": f"Prospect {i + 1}",
-            "position": positions[i % len(positions)],
-            "school": "University",
-            "grade": "A" if i < 10 else "B" if i < 32 else "C",
-        })
+        name_col = "name" if "name" in nil_df.columns else "player_name"
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
+        school_col = "school" if "school" in nil_df.columns else "team"
+        picks_per_round = 32
+        total_picks = body.num_rounds * picks_per_round
 
-    response_data = MockDraftResponse(
-        season_year=body.season_year,
-        num_rounds=body.num_rounds,
-        total_picks=total_picks,
-        draft_board=demo_board,
-        position_distribution={"QB": 5, "WR": 8, "CB": 6, "EDGE": 5},
-        top_prospects_by_position={},
-        generated_at=datetime.utcnow(),
-    )
+        # Calculate draft score for each player
+        position_draft_rates = {
+            "QB": 0.12, "WR": 0.08, "RB": 0.06, "TE": 0.05, "OT": 0.07,
+            "OG": 0.04, "C": 0.03, "EDGE": 0.09, "DT": 0.05, "LB": 0.06,
+            "CB": 0.08, "S": 0.05, "K": 0.01, "P": 0.01,
+        }
+        star_mult = {5: 6.0, 4: 3.5, 3: 1.5, 2: 0.5, 1: 0.2}
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode",
-    )
+        prospects = []
+        for _, row in nil_df.iterrows():
+            pos = str(row.get("position", "")).upper()
+            if pos in ("K", "P"):
+                continue  # Skip specialists for draft
+            stars = int(row.get("stars", 3)) if pd.notna(row.get("stars")) else 3
+            nil_val = float(row.get(val_col, 0)) if pd.notna(row.get(val_col)) else 0
+            pff = float(row.get("pff_overall", 0)) if pd.notna(row.get("pff_overall")) else 0
+
+            base = position_draft_rates.get(pos, 0.04)
+            score = base * star_mult.get(stars, 1.0)
+            if pff >= 80:
+                score *= 2.0
+            elif pff >= 70:
+                score *= 1.5
+            if nil_val >= 500000:
+                score *= 1.5
+            elif nil_val >= 100000:
+                score *= 1.2
+
+            prospects.append({
+                "name": str(row.get(name_col, "")),
+                "position": pos,
+                "school": str(row.get(school_col, "")),
+                "stars": stars,
+                "nil_value": nil_val,
+                "pff_grade": pff,
+                "draft_score": score,
+            })
+
+        # Sort by draft score
+        prospects.sort(key=lambda x: x["draft_score"], reverse=True)
+
+        # Build draft board
+        draft_board = []
+        position_dist = {}
+        top_by_position = {}
+
+        for i, p in enumerate(prospects[:total_picks]):
+            rnd = (i // picks_per_round) + 1
+            if rnd == 1:
+                grade = "A+" if i < 5 else "A"
+            elif rnd == 2:
+                grade = "B+"
+            elif rnd == 3:
+                grade = "B"
+            else:
+                grade = "C+" if rnd <= 5 else "C"
+
+            draft_board.append({
+                "pick": i + 1,
+                "round": rnd,
+                "player": p["name"],
+                "position": p["position"],
+                "school": normalize_school_name(p["school"]),
+                "grade": grade,
+                "stars": p["stars"],
+                "nil_value": round(p["nil_value"]),
+            })
+
+            pos = p["position"]
+            position_dist[pos] = position_dist.get(pos, 0) + 1
+            if pos not in top_by_position:
+                top_by_position[pos] = []
+            if len(top_by_position[pos]) < 3:
+                top_by_position[pos].append({
+                    "name": p["name"],
+                    "school": normalize_school_name(p["school"]),
+                    "pick": i + 1,
+                })
+
+        response_data = MockDraftResponse(
+            season_year=body.season_year,
+            num_rounds=body.num_rounds,
+            total_picks=len(draft_board),
+            draft_board=draft_board,
+            position_distribution=position_dist,
+            top_prospects_by_position=top_by_position,
+            generated_at=datetime.utcnow(),
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mock draft fallback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Mock draft failed: {str(e)}")
 
 
 @router.get(
@@ -1717,37 +2606,108 @@ async def roster_optimize(
         except Exception as e:
             logger.error(f"Roster optimization error: {e}")
 
-    # Demo fallback
-    allocated = body.total_budget * 0.92
+    # Data-driven roster optimization from real player data
+    try:
+        nil_df = get_nil_players(limit=50000)
+        school_norm = normalize_school_name(body.school).lower()
+        name_col = "name" if "name" in nil_df.columns else "player_name"
+        school_col = "school" if "school" in nil_df.columns else "team"
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
 
-    demo_allocations = [
-        {"player": "QB1", "position": "QB", "recommended_nil": body.total_budget * 0.18},
-        {"player": "WR1", "position": "WR", "recommended_nil": body.total_budget * 0.10},
-        {"player": "EDGE1", "position": "EDGE", "recommended_nil": body.total_budget * 0.08},
-    ]
+        # Get school's players
+        roster = nil_df[nil_df[school_col].apply(
+            lambda x: normalize_school_name(str(x)).lower()) == school_norm].copy()
 
-    response_data = RosterOptimizeResponse(
-        school=body.school,
-        total_budget=body.total_budget,
-        total_allocated=allocated,
-        budget_remaining=body.total_budget - allocated,
-        expected_wins=body.win_target or 9.0,
-        optimization_status="demo",
-        allocations=demo_allocations,
-        position_breakdown={
-            "QB": body.total_budget * 0.20,
-            "WR": body.total_budget * 0.15,
-            "EDGE": body.total_budget * 0.12,
-        },
-        retention_priorities=["QB1", "WR1"],
-        efficiency_score=0.85,
-    )
+        if roster.empty:
+            raise HTTPException(status_code=404, detail=f"No roster data found for {body.school}")
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode - provide roster data for full optimization",
-    )
+        # Sort by WAR (calculated from position, stars, NIL)
+        allocations = []
+        position_breakdown = {}
+        total_allocated = 0
+
+        for _, row in roster.iterrows():
+            p_name = str(row.get(name_col, ""))
+            p_pos = str(row.get("position", "")).upper()
+            p_nil = float(row.get(val_col, 0)) if pd.notna(row.get(val_col)) else 0
+            p_stars = int(row.get("stars", 3)) if pd.notna(row.get("stars")) else 3
+            war = calculate_player_war(p_pos, p_stars, p_nil, body.school)
+
+            allocations.append({
+                "player": p_name,
+                "position": p_pos,
+                "current_nil": round(p_nil),
+                "recommended_nil": round(p_nil),  # Will be adjusted below
+                "war": round(war, 2),
+                "stars": p_stars,
+            })
+
+        # Sort by WAR to prioritize top players
+        allocations.sort(key=lambda x: x["war"], reverse=True)
+
+        # Budget-constrained allocation: distribute budget proportional to WAR
+        total_war = sum(a["war"] for a in allocations) or 1
+        budget = body.total_budget
+
+        for alloc in allocations:
+            war_share = alloc["war"] / total_war
+            recommended = budget * war_share
+            # Cap individual allocation at 25% of total budget
+            recommended = min(recommended, budget * 0.25)
+            # Don't recommend less than current NIL (avoid pay cuts)
+            recommended = max(recommended, alloc["current_nil"] * 0.8)
+            alloc["recommended_nil"] = round(recommended)
+            total_allocated += recommended
+
+            pos = alloc["position"]
+            position_breakdown[pos] = position_breakdown.get(pos, 0) + recommended
+
+        # Round position breakdown
+        position_breakdown = {k: round(v) for k, v in position_breakdown.items()}
+
+        # Retention priorities: top WAR players whose current NIL is below recommended
+        retention_priorities = [
+            a["player"] for a in allocations[:10]
+            if a["recommended_nil"] > a["current_nil"] * 1.1
+        ][:5]
+
+        # Efficiency score: how well current spend aligns with WAR
+        current_total = sum(a["current_nil"] for a in allocations)
+        if current_total > 0 and budget > 0:
+            # Score based on how close current spend matches optimal
+            efficiency = 1.0 - abs(total_allocated - current_total) / max(budget, current_total)
+            efficiency = max(0.3, min(1.0, efficiency))
+        else:
+            efficiency = 0.5
+
+        # Expected wins from CFBD data if available
+        try:
+            cfbd = get_team_cfbd_profile(body.school)
+            current_wins = cfbd.get("wins", 7) if cfbd else 7
+        except Exception:
+            current_wins = 7
+        expected_wins = current_wins + (total_war / len(allocations) * 0.5) if allocations else current_wins
+
+        response_data = RosterOptimizeResponse(
+            school=body.school,
+            total_budget=body.total_budget,
+            total_allocated=round(total_allocated),
+            budget_remaining=round(budget - total_allocated),
+            expected_wins=round(min(expected_wins, body.win_target or 15), 1),
+            optimization_status="optimized",
+            allocations=allocations[:20],  # Top 20 allocations
+            position_breakdown=position_breakdown,
+            retention_priorities=retention_priorities,
+            efficiency_score=round(efficiency, 3),
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Roster optimization fallback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Roster optimization failed: {str(e)}")
 
 
 @router.post(
@@ -1809,37 +2769,71 @@ async def roster_scenario(
         except Exception as e:
             logger.error(f"Scenario analysis error: {e}")
 
-    # Demo fallback
-    win_delta = 0
-    total_cost = 0
-    position_impacts = {}
+    # Data-driven scenario analysis using WAR and CFBD data
+    try:
+        # Get current wins from CFBD
+        try:
+            cfbd = get_team_cfbd_profile(body.school)
+            current_wins = cfbd.get("wins", 7) if cfbd else 7
+        except Exception:
+            current_wins = 7
 
-    for change in body.changes:
-        impact = (change.overall_rating - 0.75) * 2
-        if change.action == "remove":
-            impact = -impact
-        win_delta += impact
-        total_cost += change.nil_cost or 0
-        position_impacts[change.position] = impact
+        win_delta = 0
+        total_cost = 0
+        position_impacts = {}
+        risks = []
 
-    response_data = ScenarioResponse(
-        school=body.school,
-        changes_analyzed=len(body.changes),
-        current_projected_wins=8.5,
-        new_projected_wins=8.5 + win_delta,
-        win_delta=win_delta,
-        total_nil_cost=total_cost,
-        cost_per_win=total_cost / win_delta if win_delta > 0 else None,
-        position_impacts=position_impacts,
-        recommendation="Proceed" if win_delta > 0 else "Reconsider",
-        risks=["Depth concerns"] if any(c.action == "remove" for c in body.changes) else [],
-    )
+        for change in body.changes:
+            pos = change.position.upper()
+            stars_est = max(1, min(5, int(change.overall_rating * 5)))
+            nil_cost = change.nil_cost or 0
+            war = calculate_player_war(pos, stars_est, nil_cost, body.school)
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode",
-    )
+            if change.action == "remove":
+                impact = -war
+                risks.append(f"Losing {change.name} ({pos}) removes {war:.1f} WAR")
+            else:
+                impact = war
+
+            win_delta += impact
+            total_cost += nil_cost
+            position_impacts[pos] = round(position_impacts.get(pos, 0) + impact, 2)
+
+        new_wins = current_wins + win_delta
+
+        # Build recommendation
+        if win_delta >= 2:
+            recommendation = f"Strong roster improvement: +{win_delta:.1f} wins projected. Proceed with acquisitions."
+        elif win_delta >= 0.5:
+            recommendation = f"Moderate improvement: +{win_delta:.1f} wins. Good value if within budget."
+        elif win_delta >= 0:
+            recommendation = "Marginal improvement. Consider whether cost justifies impact."
+        elif win_delta >= -1:
+            recommendation = "Slight negative impact. Ensure departures are offset by incoming talent."
+        else:
+            recommendation = f"Significant roster downgrade: {win_delta:.1f} wins. Prioritize replacements."
+
+        if not risks:
+            risks = ["No significant depth concerns identified"]
+
+        response_data = ScenarioResponse(
+            school=body.school,
+            changes_analyzed=len(body.changes),
+            current_projected_wins=round(current_wins, 1),
+            new_projected_wins=round(max(0, new_wins), 1),
+            win_delta=round(win_delta, 2),
+            total_nil_cost=total_cost,
+            cost_per_win=round(total_cost / win_delta) if win_delta > 0 else None,
+            position_impacts=position_impacts,
+            recommendation=recommendation,
+            risks=risks,
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except Exception as e:
+        logger.error(f"Scenario analysis fallback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Scenario analysis failed: {str(e)}")
 
 
 @router.get(
@@ -1881,31 +2875,149 @@ async def roster_report(
         except Exception as e:
             logger.error(f"Roster report error: {e}")
 
-    # Demo fallback
-    school_tier = _get_school_tier(school)
+    # Data-driven roster report from real data
+    try:
+        school_norm = normalize_school_name(school).lower()
 
-    response_data = RosterReportResponse(
-        school=school,
-        school_tier=school_tier,
-        generated_at=datetime.utcnow(),
-        executive_summary=[
-            f"Analysis for {school} ({school_tier} tier)",
-            "Provide roster data for complete analysis",
-        ],
-        roster_summary={"message": "Requires roster data"},
-        nil_optimization={"message": "Requires roster data"},
-        portal_shopping={"message": "Requires roster data"},
-        flight_risk={"message": "Requires roster data"},
-        win_projection={"message": "Requires roster data"},
-        gap_analysis={"message": "Requires roster data"},
-        output_files={},
-    )
+        # Get school tier
+        try:
+            from ..models.school_tiers import get_school_tier
+            tier_name, tier_info = get_school_tier(school)
+            school_tier = tier_name
+        except Exception:
+            school_tier = _get_school_tier(school)
 
-    return APIResponse(
-        status="success",
-        data=response_data.model_dump(),
-        message="Demo mode - provide roster data for full report",
-    )
+        # Get roster composition
+        roster_comp = get_team_roster_composition(school)
+
+        # Get NIL data for this school
+        nil_df = get_nil_players(limit=50000)
+        name_col = "name" if "name" in nil_df.columns else "player_name"
+        school_col_name = "school" if "school" in nil_df.columns else "team"
+        val_col = "nil_value" if "nil_value" in nil_df.columns else "predicted_nil"
+
+        school_players = nil_df[nil_df[school_col_name].apply(
+            lambda x: normalize_school_name(str(x)).lower()) == school_norm]
+
+        roster_size = len(school_players) if not school_players.empty else sum(roster_comp.values()) if roster_comp else 0
+        total_nil = float(school_players[val_col].sum()) if not school_players.empty and val_col in school_players.columns else 0
+        avg_nil = float(school_players[val_col].mean()) if not school_players.empty and val_col in school_players.columns else 0
+
+        # Top players by NIL
+        top_players = []
+        if not school_players.empty:
+            top_df = school_players.nlargest(5, val_col) if val_col in school_players.columns else school_players.head(5)
+            for _, row in top_df.iterrows():
+                top_players.append({
+                    "name": str(row.get(name_col, "")),
+                    "position": str(row.get("position", "")),
+                    "nil_value": float(row.get(val_col, 0)) if pd.notna(row.get(val_col)) else 0,
+                })
+
+        # PFF summary
+        pff_summary = get_team_pff_summary(school)
+
+        # CFBD profile
+        try:
+            cfbd = get_team_cfbd_profile(school)
+        except Exception:
+            cfbd = {}
+
+        # Portal activity
+        portal_df = get_portal_players()
+        origin_col = "origin_school" if "origin_school" in portal_df.columns else "from_school"
+        dest_col = "destination_school" if "destination_school" in portal_df.columns else "to_school"
+        outgoing = portal_df[portal_df[origin_col].apply(
+            lambda x: normalize_school_name(str(x)).lower()) == school_norm] if not portal_df.empty else pd.DataFrame()
+        incoming = portal_df[
+            (portal_df[dest_col].apply(lambda x: normalize_school_name(str(x)).lower()) == school_norm) &
+            (portal_df["status"].fillna("").str.lower() == "committed")
+        ] if not portal_df.empty and "status" in portal_df.columns else pd.DataFrame()
+
+        # Roster needs
+        needs = get_roster_needs(school, portal_df)
+
+        # Build executive summary
+        exec_summary = [
+            f"{school} ({tier_info.get('label', school_tier)}) — {roster_size} roster players",
+            f"Total NIL investment: ${total_nil:,.0f} (avg ${avg_nil:,.0f}/player)",
+        ]
+        if cfbd:
+            exec_summary.append(f"Record: {cfbd.get('wins', '?')}-{cfbd.get('losses', '?')} | SP+: {cfbd.get('sp_overall', 'N/A')}")
+        if pff_summary:
+            exec_summary.append(f"Team PFF avg: {pff_summary.get('avg_overall', 'N/A'):.1f}")
+
+        # Roster summary section
+        roster_summary = {
+            "total_players": roster_size,
+            "position_counts": roster_comp or {},
+            "top_players": top_players,
+        }
+
+        # NIL optimization section
+        nil_optimization = {
+            "total_nil_spend": round(total_nil),
+            "average_nil": round(avg_nil),
+            "top_5_spend": sum(p["nil_value"] for p in top_players),
+            "concentration": round(sum(p["nil_value"] for p in top_players[:3]) / max(total_nil, 1) * 100, 1) if top_players else 0,
+        }
+
+        # Portal shopping section
+        priority_positions = needs.get("priority_positions", [])
+        portal_shopping = {
+            "positions_of_need": priority_positions,
+            "incoming_count": len(incoming),
+            "outgoing_count": len(outgoing),
+            "net_transfers": len(incoming) - len(outgoing),
+        }
+
+        # Flight risk section (simplified)
+        flight_risk_section = {
+            "estimated_at_risk": len(outgoing),
+            "position_vulnerability": {pos: departed_positions.count(pos) for pos in set(departed_positions)} if "departed_positions" in dir() else {},
+        }
+
+        # Win projection
+        wins = cfbd.get("wins", 7) if cfbd else 7
+        win_projection = {
+            "current_wins": wins,
+            "sp_plus_rating": cfbd.get("sp_overall") if cfbd else None,
+            "talent_composite": cfbd.get("talent") if cfbd else None,
+        }
+
+        # Gap analysis
+        gap_analysis = {
+            "needs": needs.get("needs", {}),
+            "priority_positions": priority_positions,
+            "ideal_vs_actual": {
+                pos: {"ideal": IDEAL_ROSTER.get(pos, 0), "actual": roster_comp.get(pos, 0)}
+                for pos in IDEAL_ROSTER
+            } if roster_comp else {},
+        }
+
+        response_data = RosterReportResponse(
+            school=school,
+            school_tier=school_tier,
+            generated_at=datetime.utcnow(),
+            executive_summary=exec_summary,
+            roster_summary=roster_summary,
+            nil_optimization=nil_optimization,
+            portal_shopping=portal_shopping,
+            flight_risk=flight_risk_section,
+            win_projection=win_projection,
+            gap_analysis=gap_analysis,
+            output_files={},
+        )
+
+        return APIResponse(status="success", data=response_data.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Roster report fallback error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Roster report failed: {str(e)}")
 
 
 # =============================================================================
@@ -2028,8 +3140,8 @@ def _get_school_tier(school: str) -> str:
 
 
 def _get_nil_tier(value: float) -> str:
-    """Get NIL tier from value."""
-    if value >= 1000000:
+    """Get NIL tier from value. Must match calibrated_valuator.py thresholds."""
+    if value >= 2000000:
         return "mega"
     elif value >= 500000:
         return "premium"

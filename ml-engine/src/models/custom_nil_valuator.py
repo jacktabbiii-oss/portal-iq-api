@@ -189,7 +189,7 @@ class CustomNILValuator:
     # TIER THRESHOLDS
     # ==========================================================================
     TIERS = {
-        "mega": 1_000_000,
+        "mega": 2_000_000,
         "premium": 500_000,
         "solid": 100_000,
         "moderate": 25_000,

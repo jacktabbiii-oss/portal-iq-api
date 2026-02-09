@@ -249,18 +249,18 @@ def get_nil_leaderboard(
 
 
 def _get_nil_tier(value: float) -> str:
-    """Get NIL tier based on value."""
+    """Get NIL tier based on value. Must match calibrated_valuator.py thresholds."""
     if pd.isna(value) or value == 0:
         return "unknown"
-    if value >= 1_000_000:
+    if value >= 2_000_000:
         return "mega"
     if value >= 500_000:
         return "premium"
-    if value >= 200_000:
-        return "established"
-    if value >= 50_000:
-        return "emerging"
-    return "developing"
+    if value >= 100_000:
+        return "solid"
+    if value >= 25_000:
+        return "moderate"
+    return "entry"
 
 
 # =============================================================================
@@ -560,11 +560,71 @@ def get_portal_players(
 
     # Standardize column names
     df = df.rename(columns={
-        "nil_valuation": "nil_value",
+        "nil_valuation": "nil_value_raw",
         "from_school": "origin_school",
         "to_school": "destination_school",
         "rating": "overall_rating",
     })
+
+    # Enrich with calibrated NIL valuations from portal_nil_valuations.csv
+    try:
+        val_df = _load_csv("portal_nil_valuations.csv")
+        if not val_df.empty and "name" in val_df.columns:
+            val_df = val_df.rename(columns={
+                "nil_value_predicted": "nil_value",
+            })
+            # Keep only relevant columns for merge
+            val_cols = ["name"]
+            if "nil_value" in val_df.columns:
+                val_cols.append("nil_value")
+            if "nil_tier" in val_df.columns:
+                val_cols.append("nil_tier")
+            if "pff_overall" in val_df.columns:
+                val_cols.append("pff_overall")
+            if "confidence" in val_df.columns:
+                val_cols.append("confidence")
+
+            val_merge = val_df[val_cols].drop_duplicates(subset=["name"], keep="first")
+
+            # Normalize names for matching: strip periods, apostrophes, lowercase
+            import re
+            def _normalize_name(n):
+                if not isinstance(n, str):
+                    return ""
+                return re.sub(r"[.\-']", "", n).lower().strip()
+
+            df["_name_key"] = df["name"].apply(_normalize_name)
+            val_merge["_name_key"] = val_merge["name"].apply(_normalize_name)
+
+            # Drop the 'name' col from val_merge to avoid conflict, merge on normalized key
+            val_merge_keyed = val_merge.drop(columns=["name"]).drop_duplicates(subset=["_name_key"], keep="first")
+            df = df.merge(val_merge_keyed, on="_name_key", how="left")
+            df = df.drop(columns=["_name_key"])
+
+            # Use calibrated value, fall back to raw On3 value
+            if "nil_value" in df.columns:
+                raw_col = df["nil_value_raw"].fillna(0).astype(float) if "nil_value_raw" in df.columns else 0
+                df["nil_value"] = df["nil_value"].fillna(raw_col)
+            else:
+                df["nil_value"] = df.get("nil_value_raw", 0)
+
+            matched = df["nil_value"].notna().sum()
+            logger.info(f"Enriched {matched}/{len(df)} portal players with calibrated valuations")
+        else:
+            df["nil_value"] = df.get("nil_value_raw", 0)
+    except Exception as e:
+        logger.warning(f"Failed to enrich portal data with calibrated valuations: {e}")
+        df["nil_value"] = df.get("nil_value_raw", 0)
+
+    # Add NIL tier if not already present
+    if "nil_tier" not in df.columns and "nil_value" in df.columns:
+        df["nil_tier"] = df["nil_value"].apply(lambda v: _get_nil_tier(v) if pd.notna(v) else "entry")
+
+    # Normalize school names for clean display
+    if "origin_school" in df.columns:
+        df["origin_school"] = df["origin_school"].apply(normalize_school_name)
+    if "destination_school" in df.columns:
+        df["destination_school"] = df["destination_school"].apply(normalize_school_name)
 
     # Extract year from source column
     if "source" in df.columns:
@@ -648,6 +708,406 @@ def get_team_portal_rankings(year: int = 2026) -> pd.DataFrame:
         df = df[df["year"] == year]
 
     return df
+
+
+# =============================================================================
+# School Name Normalization
+# =============================================================================
+
+# FBS mascot suffixes to strip when normalizing school names
+_MASCOT_SUFFIXES = [
+    "Crimson Tide", "Fighting Irish", "Nittany Lions", "Yellow Jackets",
+    "Sun Devils", "Golden Eagles", "Demon Deacons", "Blue Devils",
+    "Red Wolves", "Golden Gophers", "Scarlet Knights", "Horned Frogs",
+    "War Eagles", "Mean Green", "Tar Heels",
+    "Longhorns", "Bulldogs", "Tigers", "Buckeyes", "Wolverines",
+    "Sooners", "Gators", "Volunteers", "Seminoles", "Hurricanes",
+    "Trojans", "Wildcats", "Ducks", "Bears", "Aggies", "Jayhawks",
+    "Cyclones", "Bruins", "Huskies", "Beavers", "Cougars",
+    "Razorbacks", "Commodores", "Rebels", "Mountaineers", "Cavaliers",
+    "Cardinals", "Hokies", "Wolfpack", "Panthers", "Owls", "Mustangs",
+    "Falcons", "Bobcats", "Rockets", "Redhawks", "Thundering Herd",
+    "Miners", "Roadrunners", "Jaguars", "Hilltoppers", "Chanticleers",
+    "Broncos", "Aztecs", "Rainbows", "Warriors", "Lobos", "Rams",
+    "Cowboys", "Buffaloes", "Utes", "Hawkeyes", "Badgers", "Hoosiers",
+    "Boilermakers", "Illini", "Cornhuskers", "Spartans", "Terrapins",
+    "Knights", "Bearcats", "Bulls",
+]
+
+# Known school name mappings (lowercase → canonical)
+_SCHOOL_NAME_MAP = {
+    "miami hurricanes": "Miami",
+    "miami (fl) hurricanes": "Miami",
+    "miami (oh) redhawks": "Miami (OH)",
+    "usc trojans": "USC",
+    "ole miss rebels": "Ole Miss",
+    "lsu tigers": "LSU",
+    "ucf knights": "UCF",
+    "smu mustangs": "SMU",
+    "byu cougars": "BYU",
+    "tcu horned frogs": "TCU",
+    "usf bulls": "South Florida",
+    "uab blazers": "UAB",
+    "utsa roadrunners": "UTSA",
+    "utep miners": "UTEP",
+    "fiu panthers": "FIU",
+    "unlv rebels": "UNLV",
+}
+
+
+def normalize_school_name(name) -> str:
+    """Normalize school name by stripping mascot suffixes.
+
+    Handles: 'Alabama Crimson Tide' → 'Alabama', 'Ole Miss Rebels' → 'Ole Miss'
+    """
+    if pd.isna(name) or not name:
+        return ""
+    name = str(name).strip()
+
+    # Check explicit mapping first
+    name_lower = name.lower()
+    if name_lower in _SCHOOL_NAME_MAP:
+        return _SCHOOL_NAME_MAP[name_lower]
+
+    # Strip mascot suffixes (try longest first to handle multi-word mascots)
+    for suffix in sorted(_MASCOT_SUFFIXES, key=len, reverse=True):
+        if name.endswith(" " + suffix):
+            stripped = name[: -(len(suffix) + 1)].strip()
+            if stripped:
+                return stripped
+
+    return name
+
+
+# =============================================================================
+# Team Aggregation Functions
+# =============================================================================
+
+# Ideal FBS roster composition by position
+IDEAL_ROSTER = {
+    "QB": 3, "RB": 4, "WR": 6, "TE": 3,
+    "OT": 4, "OG": 4, "C": 2, "OL": 10,
+    "EDGE": 4, "DT": 4, "DL": 4, "LB": 4,
+    "CB": 5, "S": 3, "K": 1, "P": 1,
+}
+
+# WAR constants (must match war.ts)
+POSITION_BASE_WAR = {
+    "QB": 3.0, "WR": 1.2, "RB": 0.9, "TE": 0.8,
+    "OT": 1.0, "OG": 0.7, "C": 0.6,
+    "EDGE": 1.5, "CB": 1.2, "S": 0.9, "LB": 1.0,
+    "DT": 0.8, "DL": 0.8, "K": 0.4, "P": 0.3, "ATH": 0.8,
+}
+
+POSITION_SCARCITY = {
+    "QB": 1.4, "EDGE": 1.3, "OT": 1.2, "CB": 1.2,
+    "WR": 1.0, "RB": 0.8,
+}
+
+STAR_WAR_MULT = {5: 2.0, 4: 1.5, 3: 1.0, 2: 0.6, 1: 0.3, 0: 0.3}
+
+# School tier WAR multipliers
+SCHOOL_TIER_WAR = {
+    "blue_blood": 1.3, "elite": 1.15, "power_strong": 1.0,
+    "power_mid": 0.95, "power_low": 0.9, "g5_strong": 0.85,
+    "g5_mid": 0.8, "fcs": 0.7,
+}
+
+
+def calculate_player_war(position: str, stars, nil_value=0, school: str = "") -> float:
+    """Calculate WAR for a single player. Must match war.ts logic."""
+    pos = str(position).upper() if position else "ATH"
+    stars_int = int(stars) if pd.notna(stars) and stars else 2
+
+    base = POSITION_BASE_WAR.get(pos, 0.8)
+    scarcity = POSITION_SCARCITY.get(pos, 1.0)
+    star_mult = STAR_WAR_MULT.get(stars_int, 0.6)
+
+    # School tier multiplier
+    school_mult = 1.0
+    if school:
+        try:
+            from ..models.school_tiers import get_school_tier
+            tier = get_school_tier(normalize_school_name(school))
+            school_mult = SCHOOL_TIER_WAR.get(tier, 0.9)
+        except Exception:
+            school_mult = 1.0
+
+    # NIL market signal bonus (calibrated baselines)
+    nil_bonus = 0
+    nil_val = float(nil_value) if pd.notna(nil_value) and nil_value else 0
+    if nil_val > 0:
+        baseline_map = {"QB": 50000, "WR": 20000, "RB": 15000, "EDGE": 15000, "CB": 12000}
+        baseline = baseline_map.get(pos, 10000)
+        ratio = nil_val / baseline
+        if ratio >= 10:
+            nil_bonus = 0.5
+        elif ratio >= 5:
+            nil_bonus = 0.35
+        elif ratio >= 2:
+            nil_bonus = 0.2
+        elif ratio >= 1:
+            nil_bonus = 0.1
+
+    raw_war = base * scarcity * star_mult * school_mult + nil_bonus * 0.7
+    return round(max(0, raw_war), 2)
+
+
+def get_team_roster_composition(school: str) -> dict:
+    """Get current roster composition by position for a school.
+
+    Returns dict of position → player count.
+    """
+    df = _load_csv("espn_rosters.csv")
+    if df.empty:
+        return {}
+
+    # Find school column
+    school_col = "team" if "team" in df.columns else "school" if "school" in df.columns else None
+    if not school_col:
+        return {}
+
+    # Normalize and match
+    school_norm = normalize_school_name(school).lower()
+    df["_school_norm"] = df[school_col].apply(lambda x: normalize_school_name(x).lower())
+    team_df = df[df["_school_norm"] == school_norm]
+
+    if team_df.empty:
+        # Try contains match
+        team_df = df[df["_school_norm"].str.contains(school_norm, na=False)]
+
+    if team_df.empty or "position" not in team_df.columns:
+        return {}
+
+    counts = team_df["position"].str.upper().value_counts().to_dict()
+    return counts
+
+
+def get_team_pff_summary(school: str) -> dict:
+    """Get average PFF grades for a school's roster."""
+    df = _load_csv("pff_player_grades.csv")
+    if df.empty:
+        return {"avg_overall": 0, "avg_offense": 0, "avg_defense": 0, "player_count": 0}
+
+    # Find team column
+    team_col = None
+    for col in ["team", "school", "Team"]:
+        if col in df.columns:
+            team_col = col
+            break
+    if not team_col:
+        return {"avg_overall": 0, "avg_offense": 0, "avg_defense": 0, "player_count": 0}
+
+    school_norm = normalize_school_name(school).lower()
+    df["_team_norm"] = df[team_col].apply(lambda x: normalize_school_name(str(x)).lower() if pd.notna(x) else "")
+    team_df = df[df["_team_norm"] == school_norm]
+
+    if team_df.empty:
+        team_df = df[df["_team_norm"].str.contains(school_norm, na=False)]
+
+    if team_df.empty:
+        return {"avg_overall": 0, "avg_offense": 0, "avg_defense": 0, "player_count": 0}
+
+    result = {"player_count": len(team_df)}
+    for col, key in [("pff_overall", "avg_overall"), ("pff_offense", "avg_offense"), ("pff_defense", "avg_defense")]:
+        if col in team_df.columns:
+            result[key] = round(team_df[col].dropna().mean(), 1) if not team_df[col].dropna().empty else 0
+        else:
+            result[key] = 0
+
+    return result
+
+
+def get_team_cfbd_profile(school: str) -> dict:
+    """Get CFBD team data: talent, SP+, records."""
+    result = {"talent": 0, "sp_overall": 0, "sp_offense": 0, "sp_defense": 0,
+              "wins": 0, "losses": 0, "conference": ""}
+
+    school_norm = normalize_school_name(school).lower()
+
+    # Team talent
+    talent_df = _load_csv("cfbd_team_talent.csv")
+    if not talent_df.empty and "school" in talent_df.columns:
+        talent_df["_norm"] = talent_df["school"].apply(lambda x: str(x).lower().strip() if pd.notna(x) else "")
+        match = talent_df[talent_df["_norm"] == school_norm]
+        if not match.empty and "talent" in match.columns:
+            result["talent"] = round(float(match.iloc[0]["talent"]), 1) if pd.notna(match.iloc[0].get("talent")) else 0
+
+    # SP+ ratings
+    sp_df = _load_csv("cfbd_sp_ratings.csv")
+    if not sp_df.empty and "school" in sp_df.columns:
+        sp_df["_norm"] = sp_df["school"].apply(lambda x: str(x).lower().strip() if pd.notna(x) else "")
+        match = sp_df[sp_df["_norm"] == school_norm]
+        if not match.empty:
+            row = match.iloc[0]
+            for col in ["sp_overall", "sp_offense", "sp_defense"]:
+                if col in row and pd.notna(row[col]):
+                    result[col] = round(float(row[col]), 1)
+            if "conference" in row and pd.notna(row["conference"]):
+                result["conference"] = str(row["conference"])
+
+    # Team records
+    records_df = _load_csv("cfbd_team_records.csv")
+    if not records_df.empty and "school" in records_df.columns:
+        records_df["_norm"] = records_df["school"].apply(lambda x: str(x).lower().strip() if pd.notna(x) else "")
+        match = records_df[records_df["_norm"] == school_norm]
+        if not match.empty:
+            row = match.iloc[0]
+            result["wins"] = int(row.get("total_wins", 0)) if pd.notna(row.get("total_wins")) else 0
+            result["losses"] = int(row.get("total_losses", 0)) if pd.notna(row.get("total_losses")) else 0
+            if not result["conference"] and "conference" in row and pd.notna(row["conference"]):
+                result["conference"] = str(row["conference"])
+
+    return result
+
+
+def get_on3_team_portal_rankings() -> pd.DataFrame:
+    """Load On3 team portal rankings for comparison/validation."""
+    df = _load_csv("on3_team_portal_rankings.csv")
+    if df.empty:
+        return pd.DataFrame()
+    # Normalize team names for matching
+    if "team" in df.columns:
+        df["team_normalized"] = df["team"].apply(normalize_school_name)
+    return df
+
+
+def get_roster_needs(school: str, incoming_players=None, outgoing_players=None) -> dict:
+    """Calculate position-by-position roster needs for a school.
+
+    Returns dict with needs per position and priority list.
+    """
+    roster = get_team_roster_composition(school)
+    needs = {}
+    priority_positions = []
+
+    for pos, ideal in IDEAL_ROSTER.items():
+        if pos == "OL":
+            continue  # OL is aggregate of OT/OG/C
+
+        current = roster.get(pos, 0)
+
+        # Count incoming/outgoing at this position
+        incoming_count = 0
+        outgoing_count = 0
+        if incoming_players:
+            incoming_count = sum(1 for p in incoming_players
+                                if str(p.get("position", "")).upper() == pos)
+        if outgoing_players:
+            outgoing_count = sum(1 for p in outgoing_players
+                                if str(p.get("position", "")).upper() == pos)
+
+        adjusted = current - outgoing_count + incoming_count
+        net = incoming_count - outgoing_count
+        deficit = ideal - adjusted
+
+        if deficit >= 2:
+            need_level = "critical"
+        elif deficit >= 1:
+            need_level = "moderate"
+        elif deficit == 0:
+            need_level = "low"
+        else:
+            need_level = "none"
+
+        needs[pos] = {
+            "current": current,
+            "ideal": ideal,
+            "incoming": incoming_count,
+            "outgoing": outgoing_count,
+            "net": net,
+            "adjusted": adjusted,
+            "need_level": need_level,
+        }
+
+        if need_level in ("critical", "moderate"):
+            priority_positions.append(pos)
+
+    return {
+        "needs": needs,
+        "priority_positions": priority_positions,
+    }
+
+
+# =============================================================================
+# Team Logos
+# =============================================================================
+
+# Cache for team_id lookup (school name → ESPN team_id)
+_team_id_cache: Optional[Dict[str, str]] = None
+
+
+def _get_team_id_lookup() -> Dict[str, str]:
+    """Build a school name → ESPN team_id lookup from espn_rosters.csv.
+
+    Returns dict mapping normalized school name (lowercase) to team_id.
+    """
+    global _team_id_cache
+    if _team_id_cache is not None:
+        return _team_id_cache
+
+    _team_id_cache = {}
+    try:
+        df = _load_csv("espn_rosters.csv")
+        if df.empty:
+            return _team_id_cache
+
+        # The ESPN rosters have 'team' (with mascot) and 'team_id'
+        team_col = "team" if "team" in df.columns else "school"
+        if team_col in df.columns and "team_id" in df.columns:
+            for _, row in df.drop_duplicates(subset=[team_col]).iterrows():
+                raw_name = str(row.get(team_col, ""))
+                team_id = row.get("team_id")
+                if raw_name and pd.notna(team_id):
+                    # Map both raw and normalized names
+                    normalized = normalize_school_name(raw_name).lower()
+                    _team_id_cache[normalized] = str(int(team_id)) if isinstance(team_id, float) else str(team_id)
+                    _team_id_cache[raw_name.lower()] = _team_id_cache[normalized]
+    except Exception as e:
+        logger.warning(f"Failed to build team ID lookup: {e}")
+
+    return _team_id_cache
+
+
+def get_team_logo_url(school: str) -> Optional[str]:
+    """Get ESPN team logo URL for a school.
+
+    Uses ESPN CDN: https://a.espncdn.com/i/teamlogos/ncaa/500/{team_id}.png
+
+    Args:
+        school: School name (with or without mascot)
+
+    Returns:
+        Logo URL string or None
+    """
+    if not school:
+        return None
+
+    lookup = _get_team_id_lookup()
+    normalized = normalize_school_name(school).lower()
+    team_id = lookup.get(normalized) or lookup.get(school.lower())
+
+    if team_id:
+        return f"https://a.espncdn.com/i/teamlogos/ncaa/500/{team_id}.png"
+    return None
+
+
+def get_all_team_logos() -> Dict[str, str]:
+    """Get all available team logo URLs.
+
+    Returns:
+        Dict mapping normalized school name to logo URL.
+    """
+    lookup = _get_team_id_lookup()
+    logos = {}
+    seen = set()
+    for school_lower, team_id in lookup.items():
+        if team_id not in seen:
+            # Use the normalized form as key
+            canonical = normalize_school_name(school_lower)
+            logos[canonical] = f"https://a.espncdn.com/i/teamlogos/ncaa/500/{team_id}.png"
+            seen.add(team_id)
+    return logos
 
 
 # =============================================================================
