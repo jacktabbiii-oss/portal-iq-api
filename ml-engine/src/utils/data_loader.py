@@ -791,7 +791,11 @@ IDEAL_ROSTER = {
     "CB": 5, "S": 3, "K": 1, "P": 1,
 }
 
-# WAR constants (must match war.ts)
+# =============================================================================
+# WAR v2 — Performance-First (must match war.ts)
+# =============================================================================
+
+# Base position WAR values (expected wins above replacement for elite player)
 POSITION_BASE_WAR = {
     "QB": 3.0, "WR": 1.2, "RB": 0.9, "TE": 0.8,
     "OT": 1.0, "OG": 0.7, "C": 0.6,
@@ -799,41 +803,158 @@ POSITION_BASE_WAR = {
     "DT": 0.8, "DL": 0.8, "K": 0.4, "P": 0.3, "ATH": 0.8,
 }
 
+# Position scarcity multiplier (harder to find quality = higher value)
 POSITION_SCARCITY = {
     "QB": 1.4, "EDGE": 1.3, "OT": 1.2, "CB": 1.2,
     "WR": 1.0, "RB": 0.8,
 }
 
-STAR_WAR_MULT = {5: 2.0, 4: 1.5, 3: 1.0, 2: 0.6, 1: 0.3, 0: 0.3}
+# Star adjustment REDUCED: secondary indicator, not primary driver
+# Old range: 0.3 to 2.0 (6.7x swing). New: 0.85 to 1.15 (1.35x swing)
+STAR_WAR_MULT = {5: 1.15, 4: 1.08, 3: 1.0, 2: 0.93, 1: 0.85, 0: 0.85}
 
-# School tier WAR multipliers
+# School tier WAR multipliers (competition level context)
 SCHOOL_TIER_WAR = {
     "blue_blood": 1.3, "elite": 1.15, "power_strong": 1.0,
     "power_mid": 0.95, "power_low": 0.9, "g5_strong": 0.85,
     "g5_mid": 0.8, "fcs": 0.7,
 }
 
+# PFF estimate from star rating (fallback when no PFF data available)
+STAR_PFF_ESTIMATE = {5: 82, 4: 72, 3: 62, 2: 55, 1: 48, 0: 48}
 
-def calculate_player_war(position: str, stars, nil_value=0, school: str = "") -> float:
-    """Calculate WAR for a single player. Must match war.ts logic."""
+# FBS average starter grade (normalization baseline: grade/65 = multiplier)
+FBS_AVG_STARTER_GRADE = 65.0
+
+
+def calculate_position_performance_score(
+    position: str,
+    pff_stats: Optional[Dict] = None,
+    stars: int = 2,
+) -> Tuple[float, str]:
+    """Calculate position-specific performance score from PFF stats.
+
+    This is the PRIMARY differentiator in WAR v2.
+
+    Returns:
+        Tuple of (performance_multiplier, confidence_type) where confidence_type
+        is "measured" if real PFF data, "projected" if estimated from stars.
+    """
+    pos = position.upper() if position else "ATH"
+
+    if not pff_stats:
+        # No PFF data: estimate from stars
+        est_grade = STAR_PFF_ESTIMATE.get(stars, 55)
+        return est_grade / FBS_AVG_STARTER_GRADE, "projected"
+
+    def _g(key, default=0.0):
+        val = pff_stats.get(key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return default
+        return float(val)
+
+    if pos == "QB":
+        pff_pass = _g("pff_passing", _g("pff_offense", _g("pff_overall", 60)))
+        pff_rush = _g("pff_rushing", 60)
+        comp_pct = _g("completion_pct", 58)
+        btt_pct = _g("big_time_throw_pct", 3.5)
+        twp_pct = _g("turnover_worthy_play_pct", 3.5)
+        comp_score = min(comp_pct / 65.0, 1.5) * 65
+        decision_bonus = max(0, (btt_pct - twp_pct)) * 3
+        grade = (0.50 * pff_pass + 0.15 * pff_rush
+                 + 0.20 * comp_score + 0.15 * min(80, 60 + decision_bonus))
+
+    elif pos in ("WR", "TE"):
+        pff_rec = _g("pff_receiving", _g("pff_offense", _g("pff_overall", 60)))
+        yprr = _g("yards_per_route_run", 1.2)
+        drop = _g("drop_rate", 8.0)
+        yprr_score = min(yprr / 1.5, 1.5) * 65
+        drop_score = max(40, 80 - drop * 3)
+        grade = 0.50 * pff_rec + 0.30 * yprr_score + 0.20 * drop_score
+
+    elif pos == "RB":
+        pff_rush = _g("pff_rushing", _g("pff_offense", _g("pff_overall", 60)))
+        elusive = _g("elusive_rating", 40)
+        yaco = _g("yaco_per_attempt", 2.0)
+        elusive_score = min(elusive / 50, 1.5) * 65
+        yaco_score = min(yaco / 2.5, 1.5) * 65
+        grade = 0.50 * pff_rush + 0.25 * elusive_score + 0.25 * yaco_score
+
+    elif pos in ("EDGE", "DL", "DE"):
+        pff_pr = _g("pff_pass_rush", _g("pff_defense", _g("pff_overall", 60)))
+        prwr = _g("pass_rush_win_rate", 10)
+        prp = _g("pass_rushing_productivity", 5)
+        prwr_score = min(prwr / 12.0, 1.5) * 65
+        prp_score = min(prp / 6.0, 1.5) * 65
+        grade = 0.50 * pff_pr + 0.30 * prwr_score + 0.20 * prp_score
+
+    elif pos == "DT":
+        pff_def = _g("pff_run_defense", _g("pff_defense", _g("pff_overall", 60)))
+        pff_pr = _g("pff_pass_rush", 55)
+        grade = 0.50 * pff_def + 0.50 * pff_pr
+
+    elif pos in ("CB", "S"):
+        pff_cov = _g("pff_coverage", _g("pff_defense", _g("pff_overall", 60)))
+        fi_rate = _g("forced_incompletion_rate", 8)
+        pra = _g("passer_rating_allowed", 90)
+        fi_score = min(fi_rate / 10.0, 1.5) * 65
+        pra_score = max(40, 90 - (pra - 70) * 0.8)
+        grade = 0.50 * pff_cov + 0.25 * fi_score + 0.25 * pra_score
+
+    elif pos in ("OT", "OG", "C", "OL", "IOL"):
+        pff_pb = _g("pff_pass_block", _g("pff_offense", _g("pff_overall", 60)))
+        pff_rb = _g("pff_run_block", _g("pff_offense", _g("pff_overall", 60)))
+        pbe = _g("pass_blocking_efficiency", 95)
+        pbe_score = min(pbe / 96.0, 1.3) * 65
+        grade = 0.40 * pff_pb + 0.35 * pff_rb + 0.25 * pbe_score
+
+    elif pos == "LB":
+        pff_def = _g("pff_defense", _g("pff_overall", 60))
+        pff_cov = _g("pff_coverage", 55)
+        pff_rd = _g("pff_run_defense", 55)
+        grade = 0.40 * pff_def + 0.30 * pff_cov + 0.30 * pff_rd
+
+    else:
+        grade = _g("pff_overall", 60)
+
+    return grade / FBS_AVG_STARTER_GRADE, "measured"
+
+
+def calculate_player_war(
+    position: str, stars=None, nil_value=0, school: str = "",
+    pff_stats: Optional[Dict] = None,
+) -> Dict:
+    """Calculate WAR for a single player. Performance-first approach.
+
+    Must match war.ts logic.
+
+    Returns dict with: war, war_low, war_high, confidence, breakdown
+    """
     pos = str(position).upper() if position else "ATH"
     stars_int = int(stars) if pd.notna(stars) and stars else 2
 
     base = POSITION_BASE_WAR.get(pos, 0.8)
     scarcity = POSITION_SCARCITY.get(pos, 1.0)
-    star_mult = STAR_WAR_MULT.get(stars_int, 0.6)
+    star_adj = STAR_WAR_MULT.get(stars_int, 0.93)
 
     # School tier multiplier
     school_mult = 1.0
+    school_tier = "unknown"
     if school:
         try:
             from ..models.school_tiers import get_school_tier
-            tier = get_school_tier(normalize_school_name(school))
-            school_mult = SCHOOL_TIER_WAR.get(tier, 0.9)
+            tier_name, tier_info = get_school_tier(normalize_school_name(school))
+            school_tier = tier_name
+            school_mult = SCHOOL_TIER_WAR.get(tier_name, 0.9)
         except Exception:
             school_mult = 1.0
 
-    # NIL market signal bonus (calibrated baselines)
+    # Performance multiplier (THE PRIMARY DIFFERENTIATOR)
+    perf_mult, confidence_type = calculate_position_performance_score(
+        pos, pff_stats, stars_int
+    )
+
+    # NIL market signal bonus (MINOR — avoid circularity with valuations)
     nil_bonus = 0
     nil_val = float(nil_value) if pd.notna(nil_value) and nil_value else 0
     if nil_val > 0:
@@ -841,16 +962,52 @@ def calculate_player_war(position: str, stars, nil_value=0, school: str = "") ->
         baseline = baseline_map.get(pos, 10000)
         ratio = nil_val / baseline
         if ratio >= 10:
-            nil_bonus = 0.5
+            nil_bonus = 0.15
         elif ratio >= 5:
-            nil_bonus = 0.35
+            nil_bonus = 0.10
         elif ratio >= 2:
-            nil_bonus = 0.2
+            nil_bonus = 0.06
         elif ratio >= 1:
-            nil_bonus = 0.1
+            nil_bonus = 0.03
 
-    raw_war = base * scarcity * star_mult * school_mult + nil_bonus * 0.7
-    return round(max(0, raw_war), 2)
+    raw_war = base * scarcity * perf_mult * school_mult * star_adj + nil_bonus
+    war = round(max(0, raw_war), 2)
+
+    # Confidence-based range
+    if confidence_type == "measured":
+        war_low = round(war * 0.85, 2)
+        war_high = round(war * 1.15, 2)
+        confidence = "high"
+    else:
+        war_low = round(war * 0.6, 2)
+        war_high = round(war * 1.4, 2)
+        confidence = "low"
+
+    return {
+        "war": war,
+        "war_low": war_low,
+        "war_high": war_high,
+        "confidence": confidence,
+        "breakdown": {
+            "base_war": round(base, 2),
+            "position_scarcity": round(scarcity, 2),
+            "performance_multiplier": round(perf_mult, 2),
+            "school_tier": school_tier,
+            "school_multiplier": round(school_mult, 2),
+            "star_adjustment": round(star_adj, 2),
+            "nil_bonus": round(nil_bonus, 2),
+            "confidence_type": confidence_type,
+        },
+    }
+
+
+def calculate_player_war_score(
+    position: str, stars=None, nil_value=0, school: str = "",
+    pff_stats: Optional[Dict] = None,
+) -> float:
+    """Convenience wrapper returning just the WAR float (backward compat)."""
+    result = calculate_player_war(position, stars, nil_value, school, pff_stats)
+    return result["war"]
 
 
 def get_team_roster_composition(school: str) -> dict:

@@ -67,7 +67,7 @@ def load_team_data() -> Optional[pd.DataFrame]:
             merged = records_df[keep].drop_duplicates(subset=["_key"], keep="first")
             logger.info(f"Loaded {len(merged)} team records")
     except Exception as e:
-        logger.debug(f"Could not load team records: {e}")
+        logger.warning(f"Could not load team records: {e}")
 
     # 2. SP+ ratings
     try:
@@ -94,7 +94,7 @@ def load_team_data() -> Optional[pd.DataFrame]:
                     merged["school"] = sp_df.set_index(sp_df["_key"])["school"]
             logger.info(f"Loaded SP+ ratings for {len(sp_slim)} teams")
     except Exception as e:
-        logger.debug(f"Could not load SP+ ratings: {e}")
+        logger.warning(f"Could not load SP+ ratings: {e}")
 
     # 3. Talent composite
     try:
@@ -114,7 +114,7 @@ def load_team_data() -> Optional[pd.DataFrame]:
                     merged["school"] = talent_df.set_index(talent_df["_key"])["school"]
             logger.info(f"Loaded talent composites for {len(talent_slim)} teams")
     except Exception as e:
-        logger.debug(f"Could not load talent composites: {e}")
+        logger.warning(f"Could not load talent composites: {e}")
 
     if merged is not None and not merged.empty:
         # Fill school name from key if missing
@@ -124,6 +124,55 @@ def load_team_data() -> Optional[pd.DataFrame]:
             merged["school"] = merged["school"].fillna(merged["_key"].str.title())
         logger.info(f"Merged CFBD data for {len(merged)} schools")
         return merged
+
+    # Fallback: try live CFBD API if CSVs are missing/empty
+    logger.warning("No CFBD CSVs available from R2 — trying live CFBD API")
+    try:
+        from ..data_collection.college.cfb_api import CFBDataAPI
+        api = CFBDataAPI()
+
+        records_df = api.get_team_records(year=2024)
+        sp_df = api.get_sp_ratings(year=2024)
+        talent_df = api.get_team_talent(year=2024)
+
+        # Merge API results
+        api_merged = None
+
+        if records_df is not None and not records_df.empty:
+            records_df["_key"] = records_df["school"].str.strip().str.lower()
+            keep = ["_key", "school", "total_wins", "total_losses", "conference"]
+            keep = [c for c in keep if c in records_df.columns]
+            api_merged = records_df[keep].drop_duplicates(subset=["_key"], keep="first")
+
+        if sp_df is not None and not sp_df.empty:
+            sp_df["_key"] = sp_df["school"].str.strip().str.lower()
+            sp_cols = ["_key", "sp_overall", "sp_offense", "sp_defense"]
+            sp_cols = [c for c in sp_cols if c in sp_df.columns]
+            sp_slim = sp_df[sp_cols].drop_duplicates(subset=["_key"], keep="first")
+            if api_merged is not None:
+                join_cols = [c for c in sp_slim.columns if c not in api_merged.columns or c == "_key"]
+                api_merged = api_merged.merge(sp_slim[join_cols], on="_key", how="outer")
+            else:
+                api_merged = sp_slim
+
+        if talent_df is not None and not talent_df.empty:
+            talent_df["_key"] = talent_df["school"].str.strip().str.lower()
+            talent_slim = talent_df[["_key", "talent"]].drop_duplicates(subset=["_key"], keep="first")
+            if api_merged is not None:
+                api_merged = api_merged.merge(talent_slim, on="_key", how="outer")
+            else:
+                api_merged = talent_slim
+
+        if api_merged is not None and not api_merged.empty:
+            if "school" not in api_merged.columns:
+                api_merged["school"] = api_merged["_key"].str.title()
+            else:
+                api_merged["school"] = api_merged["school"].fillna(api_merged["_key"].str.title())
+            logger.info(f"Loaded CFBD data from live API for {len(api_merged)} schools")
+            return api_merged
+
+    except Exception as e:
+        logger.warning(f"CFBD API fallback also failed: {e}")
 
     return None
 

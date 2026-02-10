@@ -136,6 +136,7 @@ class CalibratedNILValuator:
         "position_rank", "school_score", "school_multiplier",
         "stars", "national_rank_inv", "recruiting_rating",
         "log_followers", "class_year_num", "pff_overall",
+        "pff_position_specific", "pff_percentile",
         "has_pff", "has_followers", "has_stats",
     ]
 
@@ -249,6 +250,32 @@ class CalibratedNILValuator:
         pff_col = df.get("pff_overall", pd.Series(dtype=float))
         features["has_pff"] = (pff_col.notna() & (pff_col > 0)).astype(float)
         features["pff_overall"] = pff_col.fillna(60).clip(30, 99).astype(float)
+
+        # Position-specific PFF composite grade
+        pos_col = df.get("position", pd.Series("ATH", index=df.index)).fillna("ATH")
+        pff_specific = features["pff_overall"].copy()
+        pff_pos_map = {
+            "QB": "pff_passing", "WR": "pff_receiving", "TE": "pff_receiving",
+            "RB": "pff_rushing", "EDGE": "pff_pass_rush", "DE": "pff_pass_rush",
+            "CB": "pff_coverage", "S": "pff_coverage",
+            "OT": "pff_pass_block", "OG": "pff_pass_block", "C": "pff_pass_block",
+        }
+        for pos_name, pff_col_name in pff_pos_map.items():
+            if pff_col_name in df.columns:
+                mask = pos_col.str.upper() == pos_name
+                pos_vals = df.loc[mask, pff_col_name]
+                valid = pos_vals.notna() & (pos_vals > 0)
+                pff_specific.loc[mask & valid] = pos_vals[valid].clip(30, 99)
+        features["pff_position_specific"] = pff_specific.astype(float)
+
+        # PFF percentile within position group
+        features["pff_percentile"] = 50.0
+        for pos_name in pos_col.str.upper().unique():
+            mask = pos_col.str.upper() == pos_name
+            if mask.sum() > 5:
+                pos_pff = features.loc[mask, "pff_overall"]
+                features.loc[mask, "pff_percentile"] = pos_pff.rank(pct=True) * 100
+        features["pff_percentile"] = features["pff_percentile"].fillna(50).astype(float)
 
         # Has stats indicator
         stat_cols = ["passing_yards", "rushing_yards", "receiving_yards", "tackles", "sacks"]
@@ -568,19 +595,24 @@ class CalibratedNILValuator:
 
         Returns a value centered around 1.0 that adjusts the rank-based
         distribution value up or down based on player characteristics.
+
+        Performance (PFF) is the PRIMARY differentiator (widened range).
+        Stars are SECONDARY (reduced range).
         """
         mult = 1.0
 
-        # Stars adjustment (default 2 = neutral)
+        # Stars adjustment — REDUCED (secondary indicator)
         stars = feature_row.get("stars", 2)
-        if stars >= 4:
-            mult *= 1.4
-        elif stars >= 3:
+        if stars >= 5:
             mult *= 1.15
+        elif stars >= 4:
+            mult *= 1.08
+        elif stars >= 3:
+            mult *= 1.02
         elif stars <= 1:
-            mult *= 0.7
+            mult *= 0.85
 
-        # School quality
+        # School quality (unchanged)
         school_mult = feature_row.get("school_multiplier", 0.8)
         if school_mult >= 2.5:
             mult *= 1.3
@@ -589,17 +621,40 @@ class CalibratedNILValuator:
         elif school_mult <= 0.6:
             mult *= 0.8
 
-        # PFF performance
+        # PFF performance — WIDENED (primary differentiator)
         if feature_row.get("has_pff", 0) > 0:
             pff = feature_row.get("pff_overall", 60)
-            if pff >= 80:
-                mult *= 1.3
+            if pff >= 90:
+                mult *= 2.0      # Elite performer
+            elif pff >= 80:
+                mult *= 1.6      # Was 1.3
             elif pff >= 70:
-                mult *= 1.15
+                mult *= 1.25     # Was 1.15
+            elif pff >= 60:
+                mult *= 1.0      # Average starter
             elif pff < 55:
-                mult *= 0.85
+                mult *= 0.7      # Was 0.85
+            elif pff < 45:
+                mult *= 0.5      # Poor performer
 
-        # Has real social following
+            # Position-specific PFF grade bonus (NEW)
+            pff_pos = feature_row.get("pff_position_specific", pff)
+            if pff_pos != pff and pff_pos > 0:
+                if pff_pos >= 85:
+                    mult *= 1.25
+                elif pff_pos >= 75:
+                    mult *= 1.1
+
+        # PFF percentile within position (NEW)
+        pff_pct = feature_row.get("pff_percentile", 50)
+        if pff_pct >= 90:
+            mult *= 1.3
+        elif pff_pct >= 75:
+            mult *= 1.1
+        elif pff_pct <= 25:
+            mult *= 0.85
+
+        # Has real social following (unchanged)
         if feature_row.get("has_followers", 0) > 0:
             log_followers = feature_row.get("log_followers", 0)
             if log_followers >= 12:  # ~160K+ followers

@@ -22,6 +22,7 @@ from ..utils.data_loader import (
     _get_nil_tier,
     normalize_school_name,
     calculate_player_war,
+    calculate_player_war_score,
     get_team_roster_composition,
     get_team_pff_summary,
     get_team_cfbd_profile,
@@ -1325,7 +1326,7 @@ async def team_report(
 
         # Estimate WAR at risk
         war_at_risk = sum(
-            calculate_player_war(p["position"], p.get("stars", 3) if "stars" in p else 3, p["nil_value"], school)
+            calculate_player_war_score(p["position"], p.get("stars", 3) if "stars" in p else 3, p["nil_value"], school)
             for p in critical_risk
         )
 
@@ -1649,7 +1650,7 @@ async def portal_recommendations(
             if p_nil > body.budget * 0.5:
                 continue
 
-            war = calculate_player_war(p_pos, p_stars, p_nil, body.school)
+            war = calculate_player_war_score(p_pos, p_stars, p_nil, body.school)
 
             # Fit score: position need + talent level
             pos_need_boost = 1.2 if p_pos in target_positions else 0.8
@@ -1791,7 +1792,7 @@ async def portal_rankings(
                 pos = str(player.get("position", "")) or ""
                 stars = player.get("stars", 0)
                 nil_val = player.get("nil_value", 0)
-                war_added += calculate_player_war(pos, stars, nil_val if pd.notna(nil_val) else 0, team_str)
+                war_added += calculate_player_war_score(pos, stars, nil_val if pd.notna(nil_val) else 0, team_str)
 
             # Multi-factor portal score
             # WAR score (40% weight) - normalize to 0-100 scale
@@ -1846,7 +1847,7 @@ async def portal_rankings(
                 pos = str(player.get("position", "")) or ""
                 stars_val = player.get("stars", 0)
                 nil_val = player.get("nil_value", 0)
-                p_war = calculate_player_war(pos, stars_val, nil_val if pd.notna(nil_val) else 0, team_str)
+                p_war = calculate_player_war_score(pos, stars_val, nil_val if pd.notna(nil_val) else 0, team_str)
                 acq_list.append({
                     "name": str(player.get("name", "Unknown")),
                     "position": pos,
@@ -1958,7 +1959,7 @@ async def portal_team_activity(
                 pos = str(row.get("position", "")) or ""
                 stars = row.get("stars", 0)
                 nil_val = row.get("nil_value", 0)
-                p_war = calculate_player_war(pos, stars, nil_val if pd.notna(nil_val) else 0, team)
+                p_war = calculate_player_war_score(pos, stars, nil_val if pd.notna(nil_val) else 0, team)
                 outgoing_war_total += p_war
                 outgoing.append({
                     "player_id": str(row.get("player_id", "")),
@@ -1983,7 +1984,7 @@ async def portal_team_activity(
                 stars = row.get("stars", 0)
                 nil_val = row.get("nil_value", 0)
                 nil_float = float(nil_val) if pd.notna(nil_val) else 0
-                p_war = calculate_player_war(pos, stars, nil_float, team)
+                p_war = calculate_player_war_score(pos, stars, nil_float, team)
                 incoming_war_total += p_war
                 incoming_nil_total += nil_float
                 incoming.append({
@@ -2758,7 +2759,7 @@ async def roster_optimize(
             p_pos = str(row.get("position", "")).upper()
             p_nil = float(row.get(val_col, 0)) if pd.notna(row.get(val_col)) else 0
             p_stars = int(row.get("stars", 3)) if pd.notna(row.get("stars")) else 3
-            war = calculate_player_war(p_pos, p_stars, p_nil, body.school)
+            war = calculate_player_war_score(p_pos, p_stars, p_nil, body.school)
 
             allocations.append({
                 "player": p_name,
@@ -2914,7 +2915,7 @@ async def roster_scenario(
             pos = change.position.upper()
             stars_est = max(1, min(5, int(change.overall_rating * 5)))
             nil_cost = change.nil_cost or 0
-            war = calculate_player_war(pos, stars_est, nil_cost, body.school)
+            war = calculate_player_war_score(pos, stars_est, nil_cost, body.school)
 
             if change.action == "remove":
                 impact = -war
