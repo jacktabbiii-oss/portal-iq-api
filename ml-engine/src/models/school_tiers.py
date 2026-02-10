@@ -64,104 +64,37 @@ MANUAL_OVERRIDES = {
 
 
 def load_team_data() -> Optional[pd.DataFrame]:
-    """Load and merge CFBD team data from R2 storage."""
+    """Load and merge team data from R2 storage using available sources."""
     try:
-        # Load team records from R2 (wins, losses, conference)
-        records_df = load_csv_with_fallback("cfbd_team_records.csv", subfolder="processed")
+        # Try loading CFBD rosters to get list of all schools
+        rosters_df = load_csv_with_fallback("cfbd_rosters.csv", subfolder="processed")
 
-        if records_df is None or records_df.empty:
-            logger.warning("Team records file not found in R2")
+        if rosters_df is None or rosters_df.empty:
+            logger.warning("CFBD rosters file not found in R2")
             return None
 
-        logger.info(f"Loaded {len(records_df)} team records from R2")
+        # Get unique schools from rosters
+        if "school" in rosters_df.columns:
+            schools = rosters_df["school"].unique()
+            logger.info(f"Found {len(schools)} unique schools from CFBD rosters")
 
-        # Filter to latest season and FBS only (skip FCS/D2/D3)
-        if "year" in records_df.columns:
-            latest_year = records_df["year"].max()
-            records_df = records_df[records_df["year"] == latest_year]
-            logger.info(f"Using latest season: {latest_year}")
-
-        # Filter to major conferences for FBS
-        fbs_conferences = [
-            "SEC", "Big Ten", "ACC", "Big 12", "Pac-12",
-            "American Athletic", "Mountain West", "Sun Belt",
-            "Conference USA", "Mid-American", "FBS Independents"
-        ]
-        if "conference" in records_df.columns:
-            records_df = records_df[records_df["conference"].isin(fbs_conferences)]
-
-        logger.info(f"Filtered to {len(records_df)} FBS teams")
-
-        # Rename columns for clarity (keep total_wins for compatibility)
-        records_df = records_df.rename(columns={
-            "school": "team",
-        })
-
-        # Load SP+ ratings from R2
-        team_df = records_df.copy()
-        sp_df = load_csv_with_fallback("cfbd_sp_ratings.csv", subfolder="processed")
-
-        if sp_df is not None and not sp_df.empty:
-            if "year" in sp_df.columns:
-                latest_sp_year = sp_df["year"].max()
-                sp_df = sp_df[sp_df["year"] == latest_sp_year]
-
-            sp_df = sp_df.rename(columns={"school": "team"})
-
-            # Merge SP+ data
-            team_df = team_df.merge(
-                sp_df[["team", "sp_overall", "sp_offense", "sp_defense"]],
-                on="team",
-                how="left"
-            )
-            logger.info(f"Merged SP+ data: {sp_df['sp_overall'].notna().sum()} teams")
-
-        # Load talent composite from R2
-        talent_df = load_csv_with_fallback("cfbd_team_talent.csv", subfolder="processed")
-
-        if talent_df is not None and not talent_df.empty:
-            if "year" in talent_df.columns:
-                talent_df = talent_df[talent_df["year"] == 2024]
-
-            # Note: talent file is missing school names, so we can't merge it
-            # This is a known data issue - talent composite will be NaN for now
-            logger.warning("Talent composite file exists but missing school names - skipping merge")
-
-        # Load On3 team portal rankings from R2
-        portal_df = load_csv_with_fallback("on3_team_portal_rankings.csv", subfolder="processed")
-
-        if portal_df is not None and not portal_df.empty:
-
-            # Filter to latest year (2026 cycle)
-            if "year" in portal_df.columns:
-                latest_portal_year = portal_df["year"].max()
-                portal_df = portal_df[portal_df["year"] == latest_portal_year]
-
-            # Rename for merge
-            portal_df = portal_df.rename(columns={"team": "team_full_portal"})
-
-            # Create normalized names for matching
-            portal_df["team"] = portal_df["team_full_portal"].str.replace(" Hoosiers", "").str.replace(" Tigers", "").str.replace(" Longhorns", "").str.replace(" Crimson Tide", "").str.replace(" Buckeyes", "").str.replace(" Bulldogs", "").str.replace(" Aggies", "").str.replace(" Volunteers", "").str.replace(" Fighting Irish", "").str.replace(" Trojans", "").str.replace(" Wolverines", "").str.replace(" Sooners", "").str.replace(" Cardinals", "").str.replace(" Hurricanes", "").str.replace(" Gators", "").str.replace(" Seminoles", "").str.replace(" Badgers", "").str.replace(" Commodores", "").str.replace(" Rebels", "").str.replace(" Wildcats", "").str.replace(" Sun Devils", "").str.replace(" Red Raiders", "").str.replace(" Ducks", "").str.replace(" Cougars", "").str.replace(" Bruins", "").str.replace(" Razorbacks", "").str.replace(" Knights", "").str.strip()
-
-            # Merge portal rankings data
-            team_df = team_df.merge(
-                portal_df[[
-                    "team", "overall_rank", "overall_score",
-                    "transfers_in", "transfers_out",
-                    "avg_rating_in", "avg_rating_out",
-                    "five_stars_net", "four_stars_net", "three_stars_net",
-                    "adjusted_nil_valuation", "nil_valuation_change"
-                ]],
-                on="team",
-                how="left"
-            )
-            logger.info(f"Merged On3 portal rankings: {portal_df['overall_rank'].notna().sum()} teams")
-
-        # Add season column (use the latest year from records)
-        if "year" in team_df.columns:
-            team_df["season"] = team_df["year"]
+            # Create a basic team dataframe with schools
+            records_df = pd.DataFrame({
+                "team": schools,
+                "total_wins": 0,
+                "total_losses": 0,
+                "conference": "",
+            })
         else:
-            team_df["season"] = latest_year
+            logger.warning("School column not found in rosters")
+            return None
+
+        # Add default values for missing columns
+        team_df = records_df.copy()
+        team_df["sp_overall"] = 0
+        team_df["sp_offense"] = 0
+        team_df["sp_defense"] = 0
+        team_df["season"] = 2025
 
         # Keep column names as-is (sp_overall, sp_offense, sp_defense) for compatibility
 
