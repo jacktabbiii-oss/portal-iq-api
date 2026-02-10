@@ -2121,6 +2121,84 @@ async def all_team_logos(
     )
 
 
+@router.get(
+    "/schools/tiers",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Get all school tiers",
+    description="Get data-driven school tier classifications from CFBD data (wins, SP+, talent).",
+)
+async def school_tiers_endpoint(
+    api_key: str = Depends(require_api_key),
+):
+    """Get all school tiers calculated from real CFBD performance data."""
+    try:
+        from ..models.school_tiers import get_all_school_tiers_for_api, get_school_tiers
+
+        tier_data = get_all_school_tiers_for_api()
+
+        # Also add a flat list sorted by score for easy consumption
+        all_tiers = get_school_tiers()
+        flat_list = sorted(
+            [{"school": school, **info} for school, info in all_tiers.items()],
+            key=lambda x: x.get("score", 0),
+            reverse=True,
+        )
+
+        # Add team logo URLs
+        for entry in flat_list:
+            logo = get_team_logo_url(entry["school"])
+            if logo:
+                entry["logo_url"] = logo
+
+        tier_data["all_schools"] = flat_list
+
+        return APIResponse(status="success", data=tier_data)
+
+    except Exception as e:
+        logger.error(f"School tiers error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"School tiers failed: {str(e)}")
+
+
+@router.get(
+    "/schools/{school}/tier",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Get school tier",
+    description="Get tier classification for a specific school.",
+)
+async def school_tier_detail(
+    school: str,
+    api_key: str = Depends(require_api_key),
+):
+    """Get tier info for a single school from CFBD data."""
+    try:
+        from urllib.parse import unquote
+        school = unquote(school)
+
+        from ..models.school_tiers import get_school_tier
+
+        tier_name, tier_info = get_school_tier(school)
+
+        # Add logo
+        logo = get_team_logo_url(school)
+
+        return APIResponse(
+            status="success",
+            data={
+                "school": school,
+                "logo_url": logo,
+                **tier_info,
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"School tier detail error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =============================================================================
 # Draft Endpoints
 # =============================================================================
@@ -3059,84 +3137,16 @@ def _calculate_demo_nil_value(player_dict: Dict[str, Any]) -> float:
 
 
 def _get_school_multiplier(school: str) -> float:
-    """Get NIL multiplier based on school brand.
-
-    Uses dynamic CFBD-based tiers when available (wins, SP+, talent, recruiting).
-    Falls back to static list if CFBD data unavailable.
-
-    Updated Feb 2026 to use dynamic school_tiers module.
-    """
-    try:
-        from ..models.school_tiers import get_school_multiplier as dynamic_multiplier
-        return dynamic_multiplier(school.strip())
-    except ImportError:
-        # Fallback to static tiers
-        pass
-
-    # Static fallback (Tier 5: Blue Bloods + Recent Champions)
-    blue_bloods = [
-        "Alabama", "Ohio State", "Georgia", "Texas", "USC", "Michigan",
-        "Notre Dame", "Oklahoma", "Indiana"  # 2025 National Champions!
-    ]
-    elite = [
-        "Oregon", "Penn State", "Clemson", "LSU", "Tennessee", "Texas A&M",
-        "Florida", "Miami", "Colorado"
-    ]
-    power_brand = [
-        "Ole Miss", "Auburn", "Wisconsin", "Iowa", "UCLA", "Florida State",
-        "Arkansas", "Kentucky", "South Carolina", "Missouri", "Kansas", "Utah"
-    ]
-
-    school_clean = school.strip()
-    if school_clean in blue_bloods:
-        return 2.8
-    elif school_clean in elite:
-        return 2.0
-    elif school_clean in power_brand:
-        return 1.6
-    else:
-        return 1.0
+    """Get NIL multiplier based on school brand from real CFBD data."""
+    from ..models.school_tiers import get_school_multiplier as dynamic_multiplier
+    return dynamic_multiplier(school.strip())
 
 
 def _get_school_tier(school: str) -> str:
-    """Get school tier classification.
-
-    Uses dynamic CFBD-based tiers when available.
-    Falls back to static list if CFBD data unavailable.
-
-    Updated Feb 2026 to use dynamic school_tiers module.
-    """
-    try:
-        from ..models.school_tiers import get_school_tier as dynamic_tier
-        tier_name, tier_info = dynamic_tier(school.strip())
-        return tier_name
-    except ImportError:
-        # Fallback to static tiers
-        pass
-
-    # Static fallback
-    blue_bloods = [
-        "Alabama", "Ohio State", "Georgia", "Texas", "USC", "Michigan",
-        "Notre Dame", "Oklahoma", "Indiana"  # 2025 National Champions!
-    ]
-    elite = [
-        "Oregon", "Penn State", "Clemson", "LSU", "Tennessee", "Texas A&M",
-        "Florida", "Miami", "Colorado"
-    ]
-    power_brand = [
-        "Ole Miss", "Auburn", "Wisconsin", "Iowa", "UCLA", "Florida State",
-        "Arkansas", "Kentucky", "South Carolina", "Missouri", "Kansas", "Utah"
-    ]
-
-    school_clean = school.strip()
-    if school_clean in blue_bloods:
-        return "blue_blood"
-    elif school_clean in elite:
-        return "elite"
-    elif school_clean in power_brand:
-        return "power_brand"
-    else:
-        return "p4_mid"
+    """Get school tier classification from real CFBD data."""
+    from ..models.school_tiers import get_school_tier as dynamic_tier
+    tier_name, _ = dynamic_tier(school.strip())
+    return tier_name
 
 
 def _get_nil_tier(value: float) -> str:

@@ -1,20 +1,17 @@
 """
 Dynamic School Tier System
 
-Uses CFBD data to calculate school tiers and NIL multipliers based on:
-- Recent performance (wins, CFP appearances, championships)
-- SP+ ratings
-- Recruiting rankings
-- Talent composite
-- Portal activity (net gains/losses)
+Calculates school tiers and NIL multipliers from real CFBD data:
+- Wins (cfbd_team_records.csv)
+- SP+ ratings (cfbd_sp_ratings.csv)
+- Talent composite (cfbd_team_talent.csv)
 
-This replaces hardcoded school lists with data-driven tiers.
+Every FBS school gets a data-driven tier — no hardcoded school lists.
 """
 
 import logging
 from typing import Dict, Optional, Tuple
 from functools import lru_cache
-from pathlib import Path
 
 import pandas as pd
 
@@ -32,155 +29,161 @@ TIER_DEFINITIONS = {
     "fcs": {"multiplier": 0.5, "label": "FCS"},
 }
 
-# Manual overrides for special cases (championships, etc.)
-# Updated Feb 2026
-MANUAL_OVERRIDES = {
-    # 2025 National Champions
-    "Indiana": "blue_blood",  # Won 2025 National Championship
+# Power 4 conferences
+POWER_4_CONFERENCES = {"SEC", "Big Ten", "Big 12", "ACC"}
 
-    # Traditional blue bloods (historical significance)
-    "Alabama": "blue_blood",
-    "Ohio State": "blue_blood",
-    "Georgia": "blue_blood",
-    "Texas": "blue_blood",
-    "USC": "blue_blood",
-    "Michigan": "blue_blood",
-    "Notre Dame": "blue_blood",
-    "Oklahoma": "blue_blood",
-
-    # Recent CFP success elevates tier
-    "Clemson": "elite",
-    "LSU": "elite",
-    "Oregon": "elite",
-
-    # Prime effect / special circumstances
-    "Colorado": "elite",
-}
+# G5 conferences
+G5_CONFERENCES = {"American", "Mountain West", "Sun Belt", "MAC", "Conference USA"}
 
 
 def load_team_data() -> Optional[pd.DataFrame]:
-    """Load the most recent CFBD team data from cache or R2."""
+    """Load and merge CFBD team data from the 3 separate CSV files in R2.
+
+    Merges:
+    - cfbd_team_records.csv (wins, losses, conference)
+    - cfbd_sp_ratings.csv (SP+ overall, offense, defense)
+    - cfbd_team_talent.csv (talent composite)
+
+    Returns a single DataFrame with one row per team (most recent season).
+    """
     try:
-        # Try to load from R2 via data_loader
         from ..utils.data_loader import _load_csv
+    except ImportError:
+        logger.error("Could not import data_loader")
+        return None
 
-        # Look for team data file
-        team_df = _load_csv("cfbd_team_data.csv")
-        if team_df is not None and not team_df.empty:
-            return team_df
-    except Exception as e:
-        logger.debug(f"Could not load team data from R2: {e}")
+    merged = None
 
-    # Try local cache
+    # 1. Team records (wins, losses, conference)
     try:
-        cache_paths = [
-            Path(__file__).parent.parent.parent / "data" / "cache",
-            Path(__file__).parent.parent.parent / "data" / "processed",
-        ]
-
-        for cache_dir in cache_paths:
-            if cache_dir.exists():
-                # Find most recent team data file
-                team_files = list(cache_dir.glob("cfb_team_data*.csv"))
-                if team_files:
-                    most_recent = max(team_files, key=lambda p: p.stat().st_mtime)
-                    logger.info(f"Loading team data from {most_recent}")
-                    return pd.read_csv(most_recent)
+        records_df = _load_csv("cfbd_team_records.csv")
+        if records_df is not None and not records_df.empty:
+            if "year" in records_df.columns:
+                latest = records_df["year"].max()
+                records_df = records_df[records_df["year"] == latest].copy()
+            records_df["_key"] = records_df["school"].str.strip().str.lower()
+            keep = ["_key", "school", "total_wins", "total_losses", "conference"]
+            keep = [c for c in keep if c in records_df.columns]
+            merged = records_df[keep].drop_duplicates(subset=["_key"], keep="first")
+            logger.info(f"Loaded {len(merged)} team records")
     except Exception as e:
-        logger.debug(f"Could not load local team data: {e}")
+        logger.debug(f"Could not load team records: {e}")
+
+    # 2. SP+ ratings
+    try:
+        sp_df = _load_csv("cfbd_sp_ratings.csv")
+        if sp_df is not None and not sp_df.empty:
+            if "year" in sp_df.columns:
+                latest = sp_df["year"].max()
+                sp_df = sp_df[sp_df["year"] == latest].copy()
+            sp_df["_key"] = sp_df["school"].str.strip().str.lower()
+            sp_cols = ["_key", "sp_overall", "sp_offense", "sp_defense"]
+            if "conference" in sp_df.columns:
+                sp_cols.append("conference")
+            sp_cols = [c for c in sp_cols if c in sp_df.columns]
+            sp_slim = sp_df[sp_cols].drop_duplicates(subset=["_key"], keep="first")
+
+            if merged is not None:
+                # Don't duplicate conference column
+                join_cols = [c for c in sp_slim.columns if c not in merged.columns or c == "_key"]
+                merged = merged.merge(sp_slim[join_cols], on="_key", how="outer")
+            else:
+                merged = sp_slim
+                # Need school name
+                if "school" not in merged.columns:
+                    merged["school"] = sp_df.set_index(sp_df["_key"])["school"]
+            logger.info(f"Loaded SP+ ratings for {len(sp_slim)} teams")
+    except Exception as e:
+        logger.debug(f"Could not load SP+ ratings: {e}")
+
+    # 3. Talent composite
+    try:
+        talent_df = _load_csv("cfbd_team_talent.csv")
+        if talent_df is not None and not talent_df.empty:
+            if "year" in talent_df.columns:
+                latest = talent_df["year"].max()
+                talent_df = talent_df[talent_df["year"] == latest].copy()
+            talent_df["_key"] = talent_df["school"].str.strip().str.lower()
+            talent_slim = talent_df[["_key", "talent"]].drop_duplicates(subset=["_key"], keep="first")
+
+            if merged is not None:
+                merged = merged.merge(talent_slim, on="_key", how="outer")
+            else:
+                merged = talent_slim
+                if "school" not in merged.columns:
+                    merged["school"] = talent_df.set_index(talent_df["_key"])["school"]
+            logger.info(f"Loaded talent composites for {len(talent_slim)} teams")
+    except Exception as e:
+        logger.debug(f"Could not load talent composites: {e}")
+
+    if merged is not None and not merged.empty:
+        # Fill school name from key if missing
+        if "school" not in merged.columns:
+            merged["school"] = merged["_key"].str.title()
+        else:
+            merged["school"] = merged["school"].fillna(merged["_key"].str.title())
+        logger.info(f"Merged CFBD data for {len(merged)} schools")
+        return merged
 
     return None
 
 
 def calculate_school_score(row: pd.Series) -> float:
     """
-    Calculate a composite score for a school based on multiple factors.
+    Calculate a composite score for a school based on real CFBD metrics.
 
     Scoring (out of 100):
-    - Wins: 0-30 points (15 wins = 30 pts)
-    - SP+ Rating: 0-25 points (top 5 = 25 pts)
-    - Talent Composite: 0-25 points (top 10 = 25 pts)
-    - Recruiting Rank: 0-20 points (top 5 = 20 pts)
+    - Wins: 0-30 points (continuous scale)
+    - SP+ Rating: 0-30 points (continuous scale)
+    - Talent Composite: 0-25 points (continuous scale)
+    - Conference strength bonus: 0-15 points
     """
     score = 0.0
 
-    # Wins (0-30 points)
-    wins = row.get("total_wins", 0) or 0
-    if wins >= 15:
-        score += 30  # Undefeated/CFP
-    elif wins >= 12:
-        score += 25  # Top 10 finish
-    elif wins >= 10:
-        score += 20  # Bowl win
-    elif wins >= 8:
-        score += 15  # Bowl eligible
-    elif wins >= 6:
-        score += 10
-    elif wins >= 4:
-        score += 5
+    # Wins (0-30 points, continuous)
+    wins = float(row.get("total_wins", 0) or 0)
+    score += min(30, wins * 2.3)  # 13 wins = 29.9 pts
 
-    # SP+ Rating (0-25 points)
-    sp_overall = row.get("sp_overall", 0) or 0
-    if sp_overall >= 25:
-        score += 25  # Elite (Bama, OSU level)
-    elif sp_overall >= 20:
-        score += 22
-    elif sp_overall >= 15:
-        score += 18
-    elif sp_overall >= 10:
-        score += 14
-    elif sp_overall >= 5:
-        score += 10
-    elif sp_overall >= 0:
-        score += 5
+    # SP+ Rating (0-30 points, continuous)
+    sp_overall = float(row.get("sp_overall", 0) or 0)
+    # SP+ ranges from about -15 (worst) to +30 (best)
+    # Normalize to 0-30 point scale
+    sp_normalized = max(0, (sp_overall + 15) / 45 * 30)
+    score += min(30, sp_normalized)
 
-    # Talent Composite (0-25 points)
-    talent = row.get("talent_composite", 0) or 0
-    if talent >= 900:
-        score += 25  # Top 5
-    elif talent >= 850:
-        score += 22
-    elif talent >= 800:
-        score += 18
-    elif talent >= 750:
-        score += 14
-    elif talent >= 700:
-        score += 10
-    elif talent >= 600:
-        score += 5
+    # Talent Composite (0-25 points, continuous)
+    talent = float(row.get("talent", 0) or row.get("talent_composite", 0) or 0)
+    if talent > 0:
+        # Talent ranges from ~400 (lowest FBS) to ~1000 (Alabama/Georgia)
+        talent_normalized = max(0, (talent - 400) / 600 * 25)
+        score += min(25, talent_normalized)
 
-    # Recruiting Rank (0-20 points)
-    recruiting_rank = row.get("recruiting_rank", 100) or 100
-    if recruiting_rank <= 5:
-        score += 20
-    elif recruiting_rank <= 10:
-        score += 17
-    elif recruiting_rank <= 15:
-        score += 14
-    elif recruiting_rank <= 25:
+    # Conference strength bonus (0-15 points)
+    conference = str(row.get("conference", ""))
+    if conference in POWER_4_CONFERENCES:
         score += 10
-    elif recruiting_rank <= 40:
-        score += 6
-    elif recruiting_rank <= 60:
+        # Extra boost for SEC/Big Ten
+        if conference in ("SEC", "Big Ten"):
+            score += 5
+    elif conference in G5_CONFERENCES:
         score += 3
 
-    return score
+    return round(score, 1)
 
 
 def score_to_tier(score: float, conference: Optional[str] = None) -> str:
-    """Convert composite score to tier."""
-    # Check conference for G5/FCS
-    g5_conferences = ["American", "Mountain West", "Sun Belt", "MAC", "Conference USA"]
-    is_g5 = conference in g5_conferences if conference else False
+    """Convert composite score to tier based on data distribution."""
+    is_g5 = conference in G5_CONFERENCES if conference else False
+    is_p4 = conference in POWER_4_CONFERENCES if conference else False
 
-    if score >= 85:
+    if score >= 80:
         return "blue_blood"
-    elif score >= 70:
+    elif score >= 65:
         return "elite"
-    elif score >= 55:
+    elif score >= 50:
         return "power_strong"
-    elif score >= 40:
-        return "power_mid"
+    elif score >= 38:
+        return "power_mid" if is_p4 else "g5_strong"
     elif score >= 25:
         if is_g5:
             return "g5_strong"
@@ -188,88 +191,73 @@ def score_to_tier(score: float, conference: Optional[str] = None) -> str:
     elif score >= 15:
         return "g5_mid" if is_g5 else "power_low"
     else:
-        return "fcs" if score < 10 else "g5_mid"
+        return "fcs" if score < 8 else "g5_mid"
 
 
 @lru_cache(maxsize=1)
 def get_school_tiers() -> Dict[str, Dict]:
     """
-    Get all school tiers calculated from CFBD data.
+    Get all school tiers calculated from real CFBD data.
 
     Returns:
         Dict mapping school name to tier info:
         {
-            "Alabama": {"tier": "blue_blood", "multiplier": 3.0, "score": 95.0},
+            "Alabama": {"tier": "blue_blood", "multiplier": 3.0, "score": 95.0, ...},
             ...
         }
     """
     tiers = {}
 
-    # Load team data
+    # Load real CFBD data
     team_df = load_team_data()
 
     if team_df is not None and not team_df.empty:
-        # Get most recent season for each team
-        if "season" in team_df.columns:
-            latest_season = team_df["season"].max()
-            recent_df = team_df[team_df["season"] == latest_season].copy()
-        else:
-            recent_df = team_df.copy()
-
-        # Calculate scores and tiers
-        for _, row in recent_df.iterrows():
-            team = row.get("team", "")
-            if not team:
+        for _, row in team_df.iterrows():
+            team = str(row.get("school", "")).strip()
+            if not team or team == "nan":
                 continue
 
-            conference = row.get("conference", "")
+            conference = str(row.get("conference", ""))
             score = calculate_school_score(row)
+            tier = score_to_tier(score, conference)
 
-            # Check for manual override
-            if team in MANUAL_OVERRIDES:
-                tier = MANUAL_OVERRIDES[team]
-            else:
-                tier = score_to_tier(score, conference)
+            wins = row.get("total_wins")
+            sp_plus = row.get("sp_overall")
+            talent = row.get("talent", row.get("talent_composite"))
 
             tiers[team] = {
                 "tier": tier,
                 "multiplier": TIER_DEFINITIONS[tier]["multiplier"],
                 "label": TIER_DEFINITIONS[tier]["label"],
-                "score": round(score, 1),
-                "wins": row.get("total_wins", 0),
-                "sp_plus": row.get("sp_overall", 0),
-                "talent": row.get("talent_composite", 0),
-                "recruiting_rank": row.get("recruiting_rank", None),
+                "score": score,
+                "wins": int(wins) if pd.notna(wins) else None,
+                "losses": int(row.get("total_losses")) if pd.notna(row.get("total_losses")) else None,
+                "sp_plus": round(float(sp_plus), 1) if pd.notna(sp_plus) else None,
+                "talent": round(float(talent), 1) if pd.notna(talent) else None,
+                "conference": conference if conference and conference != "nan" else None,
             }
 
-    # Add manual overrides that might not be in data
-    for team, tier in MANUAL_OVERRIDES.items():
-        if team not in tiers:
-            tiers[team] = {
-                "tier": tier,
-                "multiplier": TIER_DEFINITIONS[tier]["multiplier"],
-                "label": TIER_DEFINITIONS[tier]["label"],
-                "score": 80.0 if tier == "blue_blood" else 65.0,  # Default scores
-                "wins": None,
-                "sp_plus": None,
-                "talent": None,
-                "recruiting_rank": None,
-            }
+        logger.info(f"Calculated data-driven tiers for {len(tiers)} schools")
+    else:
+        logger.warning("No CFBD data available — school tiers will be empty")
 
-    logger.info(f"Calculated tiers for {len(tiers)} schools")
     return tiers
 
 
 def get_school_multiplier(school: str) -> float:
     """
-    Get NIL multiplier for a school.
-
-    Uses CFBD data when available, falls back to defaults.
+    Get NIL multiplier for a school from real CFBD data.
     """
     tiers = get_school_tiers()
 
     if school in tiers:
         return tiers[school]["multiplier"]
+
+    # Try case-insensitive lookup
+    school_lower = school.lower().strip()
+    for name, info in tiers.items():
+        if name.lower() == school_lower:
+            return info["multiplier"]
 
     # Default for unknown schools
     return 0.8
@@ -277,7 +265,7 @@ def get_school_multiplier(school: str) -> float:
 
 def get_school_tier(school: str) -> Tuple[str, Dict]:
     """
-    Get tier classification for a school.
+    Get tier classification for a school from real CFBD data.
 
     Returns:
         Tuple of (tier_name, tier_info_dict)
@@ -287,11 +275,17 @@ def get_school_tier(school: str) -> Tuple[str, Dict]:
     if school in tiers:
         return tiers[school]["tier"], tiers[school]
 
+    # Try case-insensitive lookup
+    school_lower = school.lower().strip()
+    for name, info in tiers.items():
+        if name.lower() == school_lower:
+            return info["tier"], info
+
     # Default for unknown schools
-    return "power_low", {
-        "tier": "power_low",
+    return "g5_mid", {
+        "tier": "g5_mid",
         "multiplier": 0.8,
-        "label": "Unknown/Lower Tier",
+        "label": "Unknown / Not in CFBD data",
         "score": 0,
     }
 
@@ -323,10 +317,17 @@ def get_all_school_tiers_for_api() -> Dict:
     for tier in by_tier:
         by_tier[tier].sort(key=lambda x: x.get("score", 0), reverse=True)
 
+    # Flat list of all schools sorted by score
+    all_schools = []
+    for school, info in tiers.items():
+        all_schools.append({"school": school, **info})
+    all_schools.sort(key=lambda x: x.get("score", 0), reverse=True)
+
     return {
         "tiers": by_tier,
         "tier_definitions": TIER_DEFINITIONS,
         "total_schools": len(tiers),
+        "all_schools": all_schools,
     }
 
 
@@ -337,24 +338,28 @@ if __name__ == "__main__":
 
     tiers = get_school_tiers()
 
-    # Show top schools by tier
-    for tier_name in ["blue_blood", "elite", "power_strong"]:
-        print(f"\n{tier_name.upper()}:")
-        schools_in_tier = [
-            (school, info) for school, info in tiers.items()
-            if info["tier"] == tier_name
-        ]
-        schools_in_tier.sort(key=lambda x: x[1]["score"], reverse=True)
+    if not tiers:
+        print("WARNING: No CFBD data loaded. Tiers are empty.")
+        print("Make sure R2 storage has cfbd_team_records.csv, cfbd_sp_ratings.csv, cfbd_team_talent.csv")
+    else:
+        # Show top schools by tier
+        for tier_name in ["blue_blood", "elite", "power_strong", "power_mid", "g5_strong"]:
+            schools_in_tier = [
+                (school, info) for school, info in tiers.items()
+                if info["tier"] == tier_name
+            ]
+            schools_in_tier.sort(key=lambda x: x[1]["score"], reverse=True)
 
-        for school, info in schools_in_tier[:10]:
-            print(f"  {school:20s}: {info['score']:5.1f} pts, {info['multiplier']:.1f}x mult")
+            print(f"\n{TIER_DEFINITIONS[tier_name]['label']} ({tier_name}) - {len(schools_in_tier)} schools:")
+            for school, info in schools_in_tier[:8]:
+                wins_str = f"W{info['wins']}" if info.get("wins") is not None else "W?"
+                sp_str = f"SP+{info['sp_plus']}" if info.get("sp_plus") is not None else "SP+?"
+                talent_str = f"T{info['talent']}" if info.get("talent") is not None else "T?"
+                print(f"  {school:22s}: {info['score']:5.1f} pts, {info['multiplier']:.1f}x | {wins_str} {sp_str} {talent_str}")
 
-    # Test specific schools
-    print("\n" + "=" * 60)
-    print("SPECIFIC SCHOOL LOOKUPS:")
-    test_schools = ["Indiana", "Alabama", "Oregon", "Colorado", "Boise State", "Unknown School"]
-
-    for school in test_schools:
-        mult = get_school_multiplier(school)
-        tier, info = get_school_tier(school)
-        print(f"  {school:20s}: {tier:15s} ({mult:.1f}x)")
+        # Summary
+        print(f"\n{'=' * 60}")
+        print(f"Total schools: {len(tiers)}")
+        for tier_name, tier_def in TIER_DEFINITIONS.items():
+            count = sum(1 for info in tiers.values() if info["tier"] == tier_name)
+            print(f"  {tier_def['label']:35s}: {count:3d} schools ({tier_def['multiplier']:.1f}x)")

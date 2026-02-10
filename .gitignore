@@ -14,8 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -172,6 +172,22 @@ docker-compose.override.yml
 node_modules/
 npm-debug.log
 yarn-error.log
+
+# =============================================================================
+# Next.js Frontend (portal-iq-web) — override broad rules above
+# =============================================================================
+!portal-iq-web/
+!portal-iq-web/**
+!portal-iq-web/src/lib/
+!portal-iq-web/src/lib/**
+!portal-iq-web/**/*.json
+!portal-iq-web/**/*.ts
+!portal-iq-web/**/*.tsx
+!portal-iq-web/**/*.js
+!portal-iq-web/**/*.mjs
+!portal-iq-web/**/*.css
+portal-iq-web/.next/
+portal-iq-web/node_modules/
 
 # =============================================================================
 # Misc
