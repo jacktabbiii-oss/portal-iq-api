@@ -63,38 +63,68 @@ MANUAL_OVERRIDES = {
 }
 
 
+# All FBS schools (136 teams) - fallback list when data files unavailable
+ALL_FBS_SCHOOLS = [
+    # SEC (16)
+    "Alabama", "Arkansas", "Auburn", "Florida", "Georgia", "Kentucky", "LSU", "Mississippi State",
+    "Missouri", "Ole Miss", "South Carolina", "Tennessee", "Texas", "Texas A&M", "Oklahoma", "Vanderbilt",
+    # Big Ten (18)
+    "Illinois", "Indiana", "Iowa", "Maryland", "Michigan", "Michigan State", "Minnesota", "Nebraska",
+    "Northwestern", "Ohio State", "Oregon", "Penn State", "Purdue", "Rutgers", "UCLA", "USC",
+    "Washington", "Wisconsin",
+    # ACC (17)
+    "Boston College", "Clemson", "Duke", "Florida State", "Georgia Tech", "Louisville", "Miami",
+    "NC State", "North Carolina", "Notre Dame", "Pittsburgh", "SMU", "Syracuse", "Virginia",
+    "Virginia Tech", "Wake Forest", "California",
+    # Big 12 (16)
+    "Arizona", "Arizona State", "Baylor", "BYU", "Cincinnati", "Colorado", "Houston", "Iowa State",
+    "Kansas", "Kansas State", "Oklahoma State", "TCU", "Texas Tech", "UCF", "Utah", "West Virginia",
+    # Group of 5
+    # American (14)
+    "Army", "Charlotte", "East Carolina", "FAU", "Memphis", "Navy", "North Texas", "Rice",
+    "South Florida", "Temple", "Tulane", "Tulsa", "UAB", "UTSA",
+    # Mountain West (12)
+    "Air Force", "Boise State", "Colorado State", "Fresno State", "Hawaii", "Nevada",
+    "New Mexico", "San Diego State", "San Jose State", "UNLV", "Utah State", "Wyoming",
+    # Sun Belt (14)
+    "App State", "Arkansas State", "Coastal Carolina", "Georgia Southern", "Georgia State",
+    "James Madison", "Louisiana", "Marshall", "Old Dominion", "South Alabama", "Southern Miss",
+    "Texas State", "Troy", "ULM",
+    # Conference USA (10)
+    "FIU", "Jacksonville State", "Kennesaw State", "Liberty", "Louisiana Tech", "Middle Tennessee",
+    "New Mexico State", "Sam Houston", "UTEP", "Western Kentucky",
+    # MAC (12)
+    "Akron", "Ball State", "Bowling Green", "Buffalo", "Central Michigan", "Eastern Michigan",
+    "Kent State", "Miami (OH)", "Northern Illinois", "Ohio", "Toledo", "Western Michigan",
+    # Independents (3)
+    "UConn", "UMass", "Stanford",
+]
+
+
 def load_team_data() -> Optional[pd.DataFrame]:
     """Load and merge team data from R2 storage using available sources."""
     try:
         # Try loading CFBD rosters to get list of all schools
         rosters_df = load_csv_with_fallback("cfbd_rosters.csv", subfolder="processed")
 
-        if rosters_df is None or rosters_df.empty:
-            logger.warning("CFBD rosters file not found in R2")
-            return None
-
-        # Get unique schools from rosters
-        if "school" in rosters_df.columns:
+        if rosters_df is not None and not rosters_df.empty and "school" in rosters_df.columns:
             schools = rosters_df["school"].unique()
             logger.info(f"Found {len(schools)} unique schools from CFBD rosters")
-
-            # Create a basic team dataframe with schools
-            records_df = pd.DataFrame({
-                "team": schools,
-                "total_wins": 0,
-                "total_losses": 0,
-                "conference": "",
-            })
         else:
-            logger.warning("School column not found in rosters")
-            return None
+            logger.warning("Using fallback FBS school list")
+            schools = ALL_FBS_SCHOOLS
 
-        # Add default values for missing columns
-        team_df = records_df.copy()
-        team_df["sp_overall"] = 0
-        team_df["sp_offense"] = 0
-        team_df["sp_defense"] = 0
-        team_df["season"] = 2025
+        # Create a basic team dataframe with schools
+        team_df = pd.DataFrame({
+            "team": schools,
+            "total_wins": 0,
+            "total_losses": 0,
+            "conference": "",
+            "sp_overall": 0,
+            "sp_offense": 0,
+            "sp_defense": 0,
+            "season": 2025,
+        })
 
         # Keep column names as-is (sp_overall, sp_offense, sp_defense) for compatibility
 
