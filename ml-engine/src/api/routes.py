@@ -4338,3 +4338,269 @@ async def compare_teams_endpoint(
     except Exception as e:
         logger.error(f"Team comparison error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Portal Endpoints
+# =============================================================================
+
+@router.get(
+    "/portal/active",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Get active portal players",
+    description="Get current transfer portal entries with filtering and pagination.",
+)
+async def get_active_portal_players_endpoint(
+    request: Request,
+    position: Optional[str] = Query(None, description="Filter by position"),
+    origin_school: Optional[str] = Query(None, description="Filter by origin school"),
+    origin_conference: Optional[str] = Query(None, description="Filter by origin conference"),
+    min_stars: Optional[int] = Query(None, ge=2, le=5, description="Minimum star rating"),
+    status: Optional[str] = Query(None, description="Filter by status (available/committed/all)"),
+    search: Optional[str] = Query(None, description="Search player names"),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    api_key: str = Depends(require_api_key),
+):
+    """Get active transfer portal players with real On3 data."""
+    try:
+        # Get portal data
+        portal_df = get_portal_players()
+
+        if portal_df.empty:
+            return APIResponse(
+                status="success",
+                data={
+                    "players": [],
+                    "total": 0,
+                    "total_count": 0,
+                    "active_in_portal": 0,
+                    "committed": 0,
+                    "schools_active": 0,
+                    "offset": 0,
+                    "limit": limit,
+                    "has_more": False,
+                    "filters_applied": {},
+                }
+            )
+
+        # Apply filters
+        filtered_df = portal_df.copy()
+
+        if position:
+            if "position" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["position"].str.upper() == position.upper()]
+
+        if origin_school:
+            if "origin_school" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["origin_school"].str.lower().str.contains(origin_school.lower(), na=False)]
+            elif "school" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["school"].str.lower().str.contains(origin_school.lower(), na=False)]
+
+        if origin_conference:
+            if "conference" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["conference"].str.lower() == origin_conference.lower()]
+
+        if min_stars:
+            if "stars" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["stars"] >= min_stars]
+
+        if status and status.lower() != "all":
+            status_col = "status" if "status" in filtered_df.columns else None
+            if status_col:
+                if status.lower() == "available":
+                    filtered_df = filtered_df[filtered_df[status_col].fillna("").str.lower() == "available"]
+                elif status.lower() == "committed":
+                    filtered_df = filtered_df[filtered_df[status_col].fillna("").str.lower() == "committed"]
+
+        if search:
+            if "name" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["name"].str.lower().str.contains(search.lower(), na=False)]
+
+        # Calculate stats
+        total_count = len(filtered_df)
+        status_col = "status" if "status" in portal_df.columns else None
+
+        if status_col:
+            active_count = len(portal_df[portal_df[status_col].fillna("").str.lower() == "available"])
+            committed_count = len(portal_df[portal_df[status_col].fillna("").str.lower() == "committed"])
+        else:
+            active_count = len(portal_df)
+            committed_count = 0
+
+        school_col = "origin_school" if "origin_school" in portal_df.columns else "school"
+        schools_active = portal_df[school_col].nunique() if school_col in portal_df.columns else 0
+
+        # Pagination
+        paginated_df = filtered_df.iloc[offset:offset + limit]
+        has_more = (offset + limit) < total_count
+
+        # Format players
+        players = []
+        for _, row in paginated_df.iterrows():
+            player_name = str(row.get("name", "Unknown"))
+
+            players.append({
+                "player_id": str(row.get("player_id", f"portal_{len(players)}")),
+                "player_name": player_name,
+                "position": str(row.get("position", "")),
+                "origin_school": str(row.get("origin_school", row.get("school", ""))),
+                "origin_conference": str(row.get("conference", "")),
+                "destination_school": str(row.get("destination_school", "")) if pd.notna(row.get("destination_school")) else None,
+                "stars": int(row.get("stars", 3)) if pd.notna(row.get("stars")) else 3,
+                "entry_date": str(row.get("entry_date", "")) if pd.notna(row.get("entry_date")) else None,
+                "status": str(row.get("status", "available")).lower(),
+                "nil_valuation": float(row.get("nil_value", 0)) if pd.notna(row.get("nil_value")) else 0,
+                "on3_value": float(row.get("on3_value", 0)) if pd.notna(row.get("on3_value")) else None,
+                "nil_tier": str(row.get("nil_tier", "")) if pd.notna(row.get("nil_tier")) else None,
+                "days_in_portal": int(row.get("days_in_portal", 0)) if pd.notna(row.get("days_in_portal")) else None,
+                "headshot_url": str(row.get("headshot_url", "")) if pd.notna(row.get("headshot_url")) else None,
+            })
+
+        return APIResponse(
+            status="success",
+            data={
+                "players": players,
+                "total": len(paginated_df),
+                "total_count": total_count,
+                "active_in_portal": active_count,
+                "committed": committed_count,
+                "schools_active": schools_active,
+                "offset": offset,
+                "limit": limit,
+                "has_more": has_more,
+                "filters_applied": {
+                    "position": position,
+                    "origin_school": origin_school,
+                    "origin_conference": origin_conference,
+                    "min_stars": min_stars,
+                    "status": status,
+                    "search": search,
+                },
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Portal active players error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/portal/team-rankings",
+    response_model=APIResponse,
+    tags=["Portal"],
+    summary="Get portal team rankings",
+    description="Get On3 portal class rankings for 2026 cycle.",
+)
+async def get_portal_team_rankings_endpoint(
+    request: Request,
+    year: int = Query(2026, description="Portal cycle year"),
+    limit: int = Query(50, ge=1, le=100),
+    api_key: str = Depends(require_api_key),
+):
+    """Get On3 portal team rankings."""
+    try:
+        # Get On3 portal rankings
+        rankings_df = get_on3_team_portal_rankings()
+
+        if rankings_df.empty:
+            return APIResponse(
+                status="success",
+                data={"rankings": [], "total": 0, "year": year}
+            )
+
+        # Filter by year if column exists
+        if "year" in rankings_df.columns:
+            rankings_df = rankings_df[rankings_df["year"] == year]
+
+        # Sort by rank
+        if "rank" in rankings_df.columns:
+            rankings_df = rankings_df.sort_values("rank")
+
+        # Limit results
+        rankings_df = rankings_df.head(limit)
+
+        # Format rankings
+        rankings = []
+        for _, row in rankings_df.iterrows():
+            rankings.append({
+                "rank": int(row.get("rank", 0)) if pd.notna(row.get("rank")) else 0,
+                "school": str(row.get("school", "")),
+                "transfers_in": int(row.get("transfers_in", 0)) if pd.notna(row.get("transfers_in")) else 0,
+                "transfers_out": int(row.get("transfers_out", 0)) if pd.notna(row.get("transfers_out")) else 0,
+                "net_transfers": int(row.get("net_transfers", 0)) if pd.notna(row.get("net_transfers")) else 0,
+                "war_added": float(row.get("war_added", 0)) if pd.notna(row.get("war_added")) else 0,
+                "nil_invested": float(row.get("nil_invested", 0)) if pd.notna(row.get("nil_invested")) else 0,
+                "on3_score": float(row.get("on3_score", 0)) if pd.notna(row.get("on3_score")) else 0,
+                "grade": str(row.get("grade", "")) if pd.notna(row.get("grade")) else None,
+            })
+
+        return APIResponse(
+            status="success",
+            data={
+                "rankings": rankings,
+                "total": len(rankings),
+                "year": year,
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Portal team rankings error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Schools Endpoint
+# =============================================================================
+
+@router.get(
+    "/schools",
+    response_model=APIResponse,
+    tags=["Schools"],
+    summary="Get all FBS schools",
+    description="Get list of all FBS schools with tier information.",
+)
+async def get_schools_endpoint(
+    request: Request,
+    conference: Optional[str] = Query(None, description="Filter by conference"),
+    tier: Optional[str] = Query(None, description="Filter by tier"),
+    api_key: str = Depends(require_api_key),
+):
+    """Get all FBS schools."""
+    try:
+        from ..models.school_tiers import get_school_tiers
+
+        # Get all schools with tier info
+        all_schools = get_school_tiers()
+
+        # Format schools
+        schools = []
+        for school_name, info in all_schools.items():
+            school_data = {
+                "school": school_name,
+                "conference": info.get("conference", ""),
+                "tier": info.get("tier", ""),
+                "multiplier": info.get("multiplier", 1.0),
+                "logo_url": get_team_logo_url(school_name),
+            }
+
+            # Apply filters
+            if conference and school_data["conference"].lower() != conference.lower():
+                continue
+            if tier and school_data["tier"].lower() != tier.lower():
+                continue
+
+            schools.append(school_data)
+
+        return APIResponse(
+            status="success",
+            data={
+                "schools": schools,
+                "total": len(schools),
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Schools endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
