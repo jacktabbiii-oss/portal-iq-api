@@ -21,8 +21,13 @@ from .s3_storage import (
     R2NotConfiguredError,
     R2DataLoadError,
 )
+from .unified_cache import get_unified_cache
 
 logger = logging.getLogger(__name__)
+
+# Feature flag: when True, data functions read from unified in-memory cache
+# Set to False to revert to per-CSV loading behavior
+_USE_UNIFIED_CACHE = True
 
 
 # =============================================================================
@@ -145,6 +150,35 @@ def get_nil_players(
     Returns:
         DataFrame with NIL players
     """
+    # --- Unified cache path (fast: in-memory, no CSV re-parse) ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and not cache.df.empty:
+                df = cache.get_nil_leaderboard(
+                    position=position, school=school,
+                    conference=conference, limit=limit * 2,  # overfetch for value filters
+                )
+                # Apply value filters
+                if min_value is not None and "nil_value" in df.columns:
+                    df = df[df["nil_value"] >= min_value]
+                if max_value is not None and "nil_value" in df.columns:
+                    df = df[df["nil_value"] <= max_value]
+                # Ensure backward-compat columns
+                if "tier" not in df.columns and "nil_tier" in df.columns:
+                    df["tier"] = df["nil_tier"]
+                if "valuation_source" not in df.columns:
+                    if "is_predicted" in df.columns:
+                        df["valuation_source"] = df["is_predicted"].apply(
+                            lambda x: "Predicted" if x else "On3 Actual"
+                        )
+                    else:
+                        df["valuation_source"] = "Predicted"
+                return df.head(limit)
+        except Exception as e:
+            logger.warning(f"Unified cache failed, falling back to CSV: {e}")
+
+    # --- Legacy CSV path ---
     # Try proprietary valuations first
     df = _load_csv("portal_nil_valuations.csv")
 
@@ -298,6 +332,19 @@ def get_player_pff_stats(player_name: str, season: int = 2025) -> Optional[Dict[
     Returns:
         Dict with PFF stats or None if not found
     """
+    # --- Unified cache path ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and not cache.df.empty:
+                result = cache.get_player_pff_stats(player_name)
+                if result is not None:
+                    return result
+                # Fall through to legacy if not found in cache
+        except Exception as e:
+            logger.warning(f"Unified cache PFF lookup failed: {e}")
+
+    # --- Legacy CSV path ---
     df = get_pff_grades()
     if df.empty:
         return None
@@ -540,6 +587,29 @@ def get_portal_players(
     Returns:
         DataFrame with portal players
     """
+    # --- Unified cache path ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and cache.is_unified and not cache.df.empty:
+                df = cache.get_portal_players(
+                    status=status, position=position,
+                    origin_school=origin_school, limit=limit * 2,
+                )
+                if not df.empty:
+                    # Apply additional filters not in cache method
+                    if origin_conference and "conference" in df.columns:
+                        df = df[df["conference"].str.contains(origin_conference, case=False, na=False)]
+                    if min_stars and "stars" in df.columns:
+                        df = df[df["stars"] >= min_stars]
+                    # Ensure nil_tier backward compat
+                    if "nil_tier" not in df.columns and "nil_value" in df.columns:
+                        df["nil_tier"] = df["nil_value"].apply(lambda v: _get_nil_tier(v) if pd.notna(v) else "entry")
+                    return df.head(limit)
+        except Exception as e:
+            logger.warning(f"Unified cache portal lookup failed: {e}")
+
+    # --- Legacy CSV path ---
     df = _load_csv("on3_transfer_portal.csv")
 
     if df.empty:
@@ -1015,6 +1085,18 @@ def get_team_roster_composition(school: str) -> dict:
 
     Returns dict of position → player count.
     """
+    # --- Unified cache path ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and not cache.df.empty:
+                team_df = cache.get_players_by_school(school)
+                if not team_df.empty and "position" in team_df.columns:
+                    return team_df["position"].str.upper().value_counts().to_dict()
+        except Exception as e:
+            logger.warning(f"Unified cache roster comp failed: {e}")
+
+    # --- Legacy CSV path ---
     df = _load_csv("espn_rosters.csv")
     if df.empty:
         return {}
@@ -1042,6 +1124,25 @@ def get_team_roster_composition(school: str) -> dict:
 
 def get_team_pff_summary(school: str) -> dict:
     """Get average PFF grades for a school's roster."""
+    # --- Unified cache path ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and not cache.df.empty:
+                team_df = cache.get_players_by_school(school)
+                if not team_df.empty:
+                    result = {"player_count": len(team_df)}
+                    for col, key in [("pff_overall", "avg_overall"), ("pff_offense", "avg_offense"), ("pff_defense", "avg_defense")]:
+                        if col in team_df.columns:
+                            vals = team_df[col].dropna()
+                            result[key] = round(float(vals.mean()), 1) if not vals.empty else 0
+                        else:
+                            result[key] = 0
+                    return result
+        except Exception as e:
+            logger.warning(f"Unified cache PFF summary failed: {e}")
+
+    # --- Legacy CSV path ---
     df = _load_csv("pff_player_grades.csv")
     if df.empty:
         return {"avg_overall": 0, "avg_offense": 0, "avg_defense": 0, "player_count": 0}
@@ -1286,6 +1387,27 @@ def search_players(
     Returns:
         List of matching player dicts
     """
+    # --- Unified cache path ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and not cache.df.empty:
+                results_df = cache.search_players(query, limit=limit)
+                if not results_df.empty:
+                    results_df = results_df.copy()
+                    # Add data_source for compat
+                    if "in_portal" in results_df.columns:
+                        results_df["data_source"] = results_df["in_portal"].apply(
+                            lambda x: "transfer_portal" if x else "nil_rankings"
+                        )
+                    else:
+                        results_df["data_source"] = "nil_rankings"
+                    return results_df.to_dict(orient="records")
+                return []
+        except Exception as e:
+            logger.warning(f"Unified cache search failed: {e}")
+
+    # --- Legacy CSV path ---
     results = []
 
     if data_type in ("nil", "all"):
@@ -1319,6 +1441,23 @@ def search_players(
 
 def get_database_stats() -> Dict[str, Any]:
     """Get real database statistics from loaded data."""
+    # --- Unified cache path ---
+    if _USE_UNIFIED_CACHE:
+        try:
+            cache = get_unified_cache()
+            if cache.is_loaded and not cache.df.empty:
+                cache_stats = cache.get_database_stats()
+                return {
+                    "total_players": cache_stats.get("total_players", 0),
+                    "portal_players": cache_stats.get("portal_entries", 0),
+                    "nil_valuations": cache_stats.get("nil_valuations", 0),
+                    "schools": cache.df["school"].nunique() if "school" in cache.df.columns else 0,
+                    "last_updated": None,
+                }
+        except Exception as e:
+            logger.warning(f"Unified cache stats failed: {e}")
+
+    # --- Legacy CSV path ---
     stats = {
         "total_players": 0,
         "portal_players": 0,

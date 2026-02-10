@@ -31,6 +31,7 @@ from ..utils.data_loader import (
     get_team_logo_url,
     IDEAL_ROSTER,
 )
+from ..utils.unified_cache import get_unified_cache
 from ..utils.s3_storage import R2NotConfiguredError, R2DataLoadError
 
 from .schemas import (
@@ -3487,6 +3488,139 @@ async def get_player_stats(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to get player stats: {str(e)}")
+
+
+# =============================================================================
+# Unified Player Profile Endpoint
+# =============================================================================
+
+@router.get(
+    "/players/{player_name}/profile",
+    response_model=APIResponse,
+    tags=["Players"],
+    summary="Get comprehensive player profile",
+    description="Returns all player data in one call: NIL, PFF stats, WAR, portal status, school info",
+)
+async def get_player_profile(player_name: str):
+    """Get unified player profile with all data merged."""
+    try:
+        cache = get_unified_cache()
+        if not cache.is_loaded or cache.df.empty:
+            raise HTTPException(status_code=503, detail="Player data not loaded")
+
+        player = cache.get_player(player_name)
+        if player is None:
+            raise HTTPException(status_code=404, detail=f"Player '{player_name}' not found")
+
+        # Build comprehensive profile
+        profile = {
+            # Core identity
+            "name": str(player.get("name", player_name)),
+            "position": str(player.get("position", "")),
+            "school": str(player.get("school", "")),
+            "headshot_url": str(player.get("headshot_url", "")) if pd.notna(player.get("headshot_url")) else None,
+            "height": float(player.get("height")) if pd.notna(player.get("height")) else None,
+            "weight": float(player.get("weight")) if pd.notna(player.get("weight")) else None,
+            "stars": int(player.get("stars")) if pd.notna(player.get("stars")) else None,
+            "class_year": str(player.get("class_year", "")) if pd.notna(player.get("class_year")) else None,
+            "conference": str(player.get("conference", "")) if pd.notna(player.get("conference")) else None,
+        }
+
+        # NIL
+        if pd.notna(player.get("nil_value")):
+            profile["nil_value"] = float(player.get("nil_value"))
+            profile["nil_tier"] = str(player.get("nil_tier", "")) if pd.notna(player.get("nil_tier")) else None
+            profile["is_predicted"] = bool(player.get("is_predicted", True))
+            profile["confidence"] = str(player.get("confidence", "medium"))
+            profile["valuation_source"] = "On3 Actual" if not profile["is_predicted"] else "Predicted"
+        else:
+            profile["nil_value"] = None
+            profile["nil_tier"] = None
+            profile["is_predicted"] = None
+            profile["confidence"] = None
+            profile["valuation_source"] = None
+
+        # PFF stats (all available columns)
+        pff_stats = {}
+        pff_columns = [
+            "pff_overall", "pff_offense", "pff_defense",
+            "pff_passing", "pff_rushing", "pff_receiving",
+            "pff_pass_block", "pff_run_block", "pff_pass_rush",
+            "pff_coverage", "pff_run_defense", "pff_tackling",
+            "games_played", "completion_pct", "passer_rating",
+            "big_time_throw_pct", "turnover_worthy_play_pct",
+            "elusive_rating", "yaco_per_attempt", "breakaway_pct",
+            "yards_per_route_run", "drop_rate", "contested_catch_rate",
+            "targeted_qb_rating", "pass_rush_win_rate", "pass_rushing_productivity",
+            "pressures", "sacks", "forced_incompletion_rate",
+            "passer_rating_allowed", "yards_per_coverage_snap",
+            "man_grades_coverage_defense", "zone_grades_coverage_defense",
+            "pass_blocking_efficiency", "pressures_allowed",
+            "tackles", "missed_tackle_rate",
+            "targets", "receptions", "rec_yards", "yards", "touchdowns",
+        ]
+        for col in pff_columns:
+            val = player.get(col)
+            if pd.notna(val):
+                try:
+                    pff_stats[col] = float(val)
+                except (ValueError, TypeError):
+                    pass
+        profile["pff"] = pff_stats if pff_stats else None
+
+        # WAR (pre-computed)
+        if pd.notna(player.get("war")):
+            profile["war"] = float(player.get("war"))
+            profile["war_low"] = float(player.get("war_low", 0))
+            profile["war_high"] = float(player.get("war_high", 0))
+            profile["war_confidence"] = str(player.get("war_confidence", "low"))
+        else:
+            profile["war"] = None
+            profile["war_low"] = None
+            profile["war_high"] = None
+            profile["war_confidence"] = None
+
+        # Portal status
+        if pd.notna(player.get("in_portal")):
+            profile["in_portal"] = bool(player.get("in_portal"))
+            if profile["in_portal"]:
+                profile["portal_status"] = str(player.get("portal_status", "")) if pd.notna(player.get("portal_status")) else None
+                profile["origin_school"] = str(player.get("origin_school", "")) if pd.notna(player.get("origin_school")) else None
+                profile["destination_school"] = str(player.get("destination_school", "")) if pd.notna(player.get("destination_school")) else None
+                profile["portal_year"] = str(player.get("portal_year", "")) if pd.notna(player.get("portal_year")) else None
+            else:
+                profile["portal_status"] = None
+                profile["origin_school"] = None
+                profile["destination_school"] = None
+                profile["portal_year"] = None
+        else:
+            profile["in_portal"] = False
+            profile["portal_status"] = None
+            profile["origin_school"] = None
+            profile["destination_school"] = None
+            profile["portal_year"] = None
+
+        # School context
+        profile["school_tier"] = str(player.get("school_tier", "")) if pd.notna(player.get("school_tier")) else None
+        profile["school_multiplier"] = float(player.get("school_multiplier")) if pd.notna(player.get("school_multiplier")) else None
+
+        # Stats
+        for stat in ["passing_yards", "passing_tds", "rushing_yards", "rushing_tds",
+                     "receiving_yards", "receiving_tds", "tackles", "sacks"]:
+            val = player.get(stat)
+            profile[stat] = float(val) if pd.notna(val) else None
+
+        return APIResponse(
+            status="success",
+            data=profile,
+            message=f"Profile for {profile['name']}"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting player profile for {player_name}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
