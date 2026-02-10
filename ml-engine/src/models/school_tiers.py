@@ -105,13 +105,15 @@ def load_team_data() -> Optional[pd.DataFrame]:
     """Load and merge team data from R2 storage using available sources."""
     try:
         # Try loading CFBD rosters to get list of all schools
-        rosters_df = load_csv_with_fallback("cfbd_rosters.csv", subfolder="processed")
-
-        if rosters_df is not None and not rosters_df.empty and "school" in rosters_df.columns:
-            schools = rosters_df["school"].unique()
-            logger.info(f"Found {len(schools)} unique schools from CFBD rosters")
-        else:
-            logger.warning("Using fallback FBS school list")
+        try:
+            rosters_df = load_csv_with_fallback("cfbd_rosters.csv", subfolder="processed")
+            if rosters_df is not None and not rosters_df.empty and "school" in rosters_df.columns:
+                schools = rosters_df["school"].unique()
+                logger.info(f"Found {len(schools)} unique schools from CFBD rosters")
+            else:
+                raise ValueError("Invalid rosters data")
+        except Exception as e:
+            logger.warning(f"Using fallback FBS school list - rosters load failed: {e}")
             schools = ALL_FBS_SCHOOLS
 
         # Create a basic team dataframe with schools

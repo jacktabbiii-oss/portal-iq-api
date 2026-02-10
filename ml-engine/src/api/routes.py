@@ -4196,24 +4196,29 @@ async def get_team_rankings_endpoint(
                 transfers_out = int(portal_data.iloc[0]["transfers_out"]) if not portal_data.empty and "transfers_out" in portal_data.columns else 0
                 net_transfers = transfers_in - transfers_out
 
-                # Calculate component scores (100-point scale)
+                # Calculate component scores (100-point scale) - handle None values
                 # On-Field Performance (30%)
+                sp_rating = sp_rating if sp_rating is not None else 0
+                win_pct = win_pct if win_pct is not None else 0.5
                 sp_normalized = min(max((sp_rating + 20) / 40, 0), 1)  # Normalize SP+ (-20 to +20)
                 win_normalized = win_pct  # Already 0-1
                 on_field_score = (sp_normalized * 0.6 + win_normalized * 0.4) * 30
 
                 # Roster Quality (25%)
-                pff_normalized = pff_avg / 100  # PFF is 0-100
-                nil_talent_normalized = min(nil_talent / 50_000_000, 1)  # Cap at $50M
+                pff_avg = pff_avg if pff_avg is not None else 0
+                nil_talent = nil_talent if nil_talent is not None else 0
+                pff_normalized = pff_avg / 100 if pff_avg > 0 else 0  # PFF is 0-100
+                nil_talent_normalized = min(nil_talent / 50_000_000, 1) if nil_talent > 0 else 0  # Cap at $50M
                 roster_score = (pff_normalized * 0.6 + nil_talent_normalized * 0.4) * 25
 
                 # Portal Performance (25%)
+                portal_rank = portal_rank if portal_rank is not None and portal_rank > 0 else 99
                 portal_rank_normalized = 1 - (min(portal_rank, 50) / 50)  # Top 50 scale
                 net_transfers_normalized = min(max(net_transfers / 20, -1), 1)  # -20 to +20 range
                 portal_score = (portal_rank_normalized * 0.7 + (net_transfers_normalized + 1) / 2 * 0.3) * 25
 
                 # NIL/Recruiting Power (20%)
-                nil_spending_normalized = min(nil_talent / 30_000_000, 1)  # Cap at $30M
+                nil_spending_normalized = min(nil_talent / 30_000_000, 1) if nil_talent > 0 else 0  # Cap at $30M
                 nil_score = nil_spending_normalized * 20
 
                 # Total Power Score
