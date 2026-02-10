@@ -245,24 +245,7 @@ def load_draft_data() -> pd.DataFrame:
         _draft_data_loaded = True
         return df
     except R2DataLoadError:
-        logger.warning("Draft data not found in R2")
-
-    # Try local file
-    try:
-        import os
-        local_path = os.path.join(
-            os.path.dirname(__file__),
-            "..", "..", "data", "raw", "nfl_draft_picks.csv"
-        )
-        if os.path.exists(local_path):
-            df = pd.read_csv(local_path)
-            df["drafted"] = True
-            logger.info(f"Loaded {len(df)} draft picks from local file")
-            _draft_data_cache = df
-            _draft_data_loaded = True
-            return df
-    except Exception as e:
-        logger.warning(f"Could not load local draft data: {e}")
+        logger.warning("Draft data not found in R2 — no local fallback (R2 required)")
 
     _draft_data_loaded = True
     _draft_data_cache = pd.DataFrame()

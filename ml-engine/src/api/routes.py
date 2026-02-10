@@ -80,21 +80,26 @@ def get_models(request: Request) -> Dict[str, Any]:
 
 
 async def require_api_key(request: Request) -> str:
-    """Require API key authentication."""
+    """Require API key authentication.
+
+    API keys MUST be set via PORTAL_IQ_API_KEYS environment variable.
+    No hardcoded keys — fails closed if env var is missing.
+    """
     api_key = request.headers.get("X-API-Key")
     from fastapi import HTTPException
 
-    valid_keys = {"dev-key-123", "64c60545aa2809c7fc69d4bb6cc9743a8690df00e19c28ad32b022befa9c2ec1"}
+    import os
+    keys_env = os.getenv("PORTAL_IQ_API_KEYS", "")
+    if not keys_env.strip():
+        # In development, allow ENABLE_AUTH=false to skip key check entirely
+        if os.getenv("ENABLE_AUTH", "true").lower() == "false":
+            return api_key or "dev-no-auth"
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "API keys not configured", "message": "Set PORTAL_IQ_API_KEYS environment variable"},
+        )
 
-    # Also try to get from app state
-    try:
-        import os
-        from dotenv import load_dotenv
-        load_dotenv()
-        keys_env = os.getenv("PORTAL_IQ_API_KEYS", "dev-key-123")
-        valid_keys.update(k.strip() for k in keys_env.split(",") if k.strip())
-    except:
-        pass
+    valid_keys = {k.strip() for k in keys_env.split(",") if k.strip()}
 
     if not api_key:
         raise HTTPException(status_code=401, detail={"error": "Missing API key", "message": "Include X-API-Key header"})
@@ -262,33 +267,48 @@ async def predict_nil(
         import traceback
         logger.error(f"CustomNILValuator error: {e}\n{traceback.format_exc()}")
 
-        # Final fallback to simple demo calculation
-        demo_value = _calculate_demo_nil_value(player_dict)
+        # Fallback: use CalibratedNILValuator (rank-based, always available if data loaded)
+        try:
+            from ..models.calibrated_valuator import CalibratedNILValuator
+            cal_valuator = CalibratedNILValuator()
+            cal_result = cal_valuator.predict(
+                name=body.player.name,
+                school=body.player.school,
+                position=body.player.position,
+                stars=player_dict.get("stars"),
+            )
+            fallback_value = cal_result.nil_value
 
-        response_data = NILPredictResponse(
-            player_name=body.player.name,
-            school=body.player.school,
-            position=body.player.position,
-            predicted_value=demo_value,
-            value_tier=_get_nil_tier(demo_value),
-            tier_probabilities={"moderate": 0.6, "solid": 0.3, "entry": 0.1},
-            confidence=0.65,
-            value_breakdown=NILValueBreakdown(
-                base_value=demo_value * 0.4,
-                social_media_premium=demo_value * 0.2,
-                school_brand_factor=demo_value * 0.2,
-                position_market_factor=demo_value * 0.15,
-                draft_potential_premium=demo_value * 0.05,
-            ),
-            comparable_players=[],
-            percentile=50.0,
-        )
+            response_data = NILPredictResponse(
+                player_name=body.player.name,
+                school=body.player.school,
+                position=body.player.position,
+                predicted_value=fallback_value,
+                value_tier=_get_nil_tier(fallback_value),
+                tier_probabilities={cal_result.nil_tier: 0.7, "moderate": 0.2, "entry": 0.1},
+                confidence=0.5,
+                value_breakdown=NILValueBreakdown(
+                    base_value=fallback_value * 0.5,
+                    social_media_premium=0,
+                    school_brand_factor=fallback_value * 0.25,
+                    position_market_factor=fallback_value * 0.2,
+                    draft_potential_premium=fallback_value * 0.05,
+                ),
+                comparable_players=[],
+                percentile=cal_result.percentile if hasattr(cal_result, "percentile") else 50.0,
+            )
 
-        return APIResponse(
-            status="success",
-            data=response_data.model_dump(),
-            message="Demo mode - fallback calculation",
-        )
+            return APIResponse(
+                status="success",
+                data=response_data.model_dump(),
+                message="Fallback to calibrated rank-based valuation",
+            )
+        except Exception as cal_err:
+            logger.error(f"CalibratedNILValuator fallback also failed: {cal_err}")
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "Valuation unavailable", "message": "All valuation models failed. Check R2 data availability."},
+            )
 
 
 @router.post(
@@ -350,7 +370,22 @@ async def transfer_impact(
                 current_value = float(match[val_col].iloc[0])
 
         if current_value == 0:
-            current_value = _calculate_demo_nil_value(player_dict)
+            # Use CalibratedNILValuator instead of demo calculation
+            try:
+                from ..models.calibrated_valuator import CalibratedNILValuator
+                cal = CalibratedNILValuator()
+                cal_result = cal.predict(
+                    name=body.player.name,
+                    school=body.player.school,
+                    position=body.player.position,
+                    stars=player_dict.get("stars"),
+                )
+                current_value = cal_result.nil_value
+            except Exception:
+                # Last resort: position-based median from real data
+                pos = body.player.position.upper()
+                pos_medians = {"QB": 25000, "WR": 8000, "RB": 6000, "EDGE": 10000, "CB": 7000, "OT": 5000, "LB": 5000, "S": 5000, "TE": 5000, "DT": 5000}
+                current_value = pos_medians.get(pos, 5000)
 
         # Get school tier multipliers
         try:
@@ -1382,7 +1417,21 @@ async def portal_fit(
     stars = player_dict.get("stars") or player_dict.get("overall_rating", 0.75) * 5
     if isinstance(stars, float) and stars <= 1.0:
         stars = round(stars * 5)
-    player_nil = player_dict.get("nil_value", 0) or _calculate_demo_nil_value(player_dict)
+    player_nil = player_dict.get("nil_value", 0)
+    if not player_nil:
+        # Use CalibratedNILValuator for missing NIL values
+        try:
+            from ..models.calibrated_valuator import CalibratedNILValuator
+            cal = CalibratedNILValuator()
+            cal_result = cal.predict(
+                name=player_dict.get("name", ""),
+                school=player_dict.get("school", ""),
+                position=position,
+                stars=int(stars) if stars else None,
+            )
+            player_nil = cal_result.nil_value
+        except Exception:
+            player_nil = 5000  # Conservative floor
 
     # 1. Position need at target school (35% weight)
     try:
@@ -3099,41 +3148,8 @@ async def roster_report(
 
 
 # =============================================================================
-# Demo Helper Functions
+# Helper Functions
 # =============================================================================
-
-def _calculate_demo_nil_value(player_dict: Dict[str, Any]) -> float:
-    """Calculate demo NIL value based on player attributes."""
-    base_value = 50000
-
-    # Position multiplier
-    position_mult = {
-        "QB": 3.0, "WR": 1.5, "RB": 1.2, "TE": 1.0,
-        "OT": 0.9, "OG": 0.7, "C": 0.7,
-        "EDGE": 1.3, "DT": 0.9, "LB": 0.8,
-        "CB": 1.2, "S": 0.9,
-    }.get(player_dict.get("position", "").upper(), 1.0)
-
-    # Rating multiplier
-    rating = player_dict.get("overall_rating")
-    if rating is None:
-        rating = 0.75
-    rating_mult = 1.0 + (rating - 0.75) * 5
-
-    # Social media bonus
-    social = player_dict.get("social_media") or {}
-    followers = (
-        (social.get("instagram_followers") or 0) +
-        (social.get("twitter_followers") or 0) +
-        (social.get("tiktok_followers") or 0)
-    )
-    social_bonus = min(followers / 10, 500000)  # Cap at 500k bonus
-
-    # School multiplier
-    school = player_dict.get("school", "")
-    school_mult = _get_school_multiplier(school)
-
-    return (base_value * position_mult * rating_mult * school_mult) + social_bonus
 
 
 def _get_school_multiplier(school: str) -> float:
