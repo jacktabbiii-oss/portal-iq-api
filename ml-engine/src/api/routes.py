@@ -4132,3 +4132,209 @@ async def list_historical_data_endpoint(
                 "message": "Could not enumerate historical data",
             }
         )
+
+
+# =============================================================================
+# Team Rankings Endpoints
+# =============================================================================
+
+@router.get(
+    "/teams/rankings",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Get team power rankings",
+    description="Get comprehensive team rankings with Portal IQ proprietary algorithm (100-point scale).",
+)
+async def get_team_rankings_endpoint(
+    request: Request,
+    conference: Optional[str] = Query(None, description="Filter by conference"),
+    tier: Optional[str] = Query(None, description="Filter by school tier"),
+    sort_by: str = Query("power_score", description="Sort field"),
+    limit: int = Query(130, ge=1, le=200, description="Max results"),
+    api_key: str = Depends(require_api_key),
+):
+    """Get team power rankings with Portal IQ proprietary algorithm."""
+    try:
+        from ..models.school_tiers import get_school_tier, get_school_tiers
+
+        # Get all FBS schools with tier info
+        all_schools_tiers = get_school_tiers()
+        schools = [{"school": school, **info} for school, info in all_schools_tiers.items()]
+
+        # Get NIL data
+        nil_df = get_nil_players()
+
+        # Get portal rankings
+        portal_rankings = get_on3_team_portal_rankings(year=2026)
+
+        # Calculate rankings for each school
+        rankings = []
+
+        for school in schools:
+            try:
+                school_name = school["school"]
+                school_tier = school.get("tier", "power_mid")
+                school_multiplier = school.get("multiplier", 1.4)
+
+                # Get CFBD profile (SP+ rating, wins)
+                cfbd_profile = get_team_cfbd_profile(school_name)
+                sp_rating = cfbd_profile.get("sp_rating", 0)
+                win_pct = cfbd_profile.get("win_pct", 0.5)
+
+                # Get roster PFF summary
+                pff_summary = get_team_pff_summary(school_name)
+                pff_avg = pff_summary.get("overall_avg", 0)
+
+                # Get NIL talent for this school
+                school_nil = nil_df[nil_df["school"].str.lower() == school_name.lower()] if not nil_df.empty else pd.DataFrame()
+                nil_talent = school_nil["nil_value"].sum() if not school_nil.empty and "nil_value" in school_nil.columns else 0
+
+                # Get portal data for this school
+                portal_data = portal_rankings[portal_rankings["school"].str.lower() == school_name.lower()] if not portal_rankings.empty else pd.DataFrame()
+                portal_rank = int(portal_data.iloc[0]["rank"]) if not portal_data.empty and "rank" in portal_data.columns else 99
+                transfers_in = int(portal_data.iloc[0]["transfers_in"]) if not portal_data.empty and "transfers_in" in portal_data.columns else 0
+                transfers_out = int(portal_data.iloc[0]["transfers_out"]) if not portal_data.empty and "transfers_out" in portal_data.columns else 0
+                net_transfers = transfers_in - transfers_out
+
+                # Calculate component scores (100-point scale)
+                # On-Field Performance (30%)
+                sp_normalized = min(max((sp_rating + 20) / 40, 0), 1)  # Normalize SP+ (-20 to +20)
+                win_normalized = win_pct  # Already 0-1
+                on_field_score = (sp_normalized * 0.6 + win_normalized * 0.4) * 30
+
+                # Roster Quality (25%)
+                pff_normalized = pff_avg / 100  # PFF is 0-100
+                nil_talent_normalized = min(nil_talent / 50_000_000, 1)  # Cap at $50M
+                roster_score = (pff_normalized * 0.6 + nil_talent_normalized * 0.4) * 25
+
+                # Portal Performance (25%)
+                portal_rank_normalized = 1 - (min(portal_rank, 50) / 50)  # Top 50 scale
+                net_transfers_normalized = min(max(net_transfers / 20, -1), 1)  # -20 to +20 range
+                portal_score = (portal_rank_normalized * 0.7 + (net_transfers_normalized + 1) / 2 * 0.3) * 25
+
+                # NIL/Recruiting Power (20%)
+                nil_spending_normalized = min(nil_talent / 30_000_000, 1)  # Cap at $30M
+                nil_score = nil_spending_normalized * 20
+
+                # Total Power Score
+                power_score = on_field_score + roster_score + portal_score + nil_score
+
+                rankings.append({
+                    "school": school_name,
+                    "conference": school.get("conference", ""),
+                    "tier": school_tier,
+                    "school_multiplier": school_multiplier,
+                    "power_score": round(power_score, 1),
+                    "on_field_score": round(on_field_score, 1),
+                    "roster_score": round(roster_score, 1),
+                    "portal_score": round(portal_score, 1),
+                    "nil_score": round(nil_score, 1),
+                    "sp_rating": round(sp_rating, 1),
+                    "win_pct": round(win_pct, 3),
+                    "pff_avg": round(pff_avg, 1),
+                    "nil_talent": nil_talent,
+                    "portal_rank": portal_rank,
+                    "transfers_in": transfers_in,
+                    "transfers_out": transfers_out,
+                    "net_transfers": net_transfers,
+                    "logo_url": get_team_logo_url(school_name),
+                })
+
+            except Exception as e:
+                logger.error(f"Error calculating ranking for {school.get('school', 'Unknown')}: {e}")
+                continue
+
+        # Sort rankings
+        rankings.sort(key=lambda x: x.get(sort_by, 0), reverse=True)
+
+        # Add rank numbers
+        for i, team in enumerate(rankings, 1):
+            team["rank"] = i
+
+        # Apply filters
+        if conference:
+            rankings = [r for r in rankings if r.get("conference", "").lower() == conference.lower()]
+
+        if tier:
+            rankings = [r for r in rankings if r.get("tier", "").lower() == tier.lower()]
+
+        # Limit results
+        rankings = rankings[:limit]
+
+        return APIResponse(
+            status="success",
+            data={
+                "rankings": rankings,
+                "total": len(rankings),
+                "filters": {
+                    "conference": conference,
+                    "tier": tier,
+                    "sort_by": sort_by,
+                },
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Team rankings error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/teams/compare",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Compare multiple teams",
+    description="Side-by-side comparison of 2-4 teams across all metrics.",
+)
+async def compare_teams_endpoint(
+    request: Request,
+    schools: str = Query(..., description="Comma-separated school names"),
+    api_key: str = Depends(require_api_key),
+):
+    """Compare multiple teams side-by-side."""
+    try:
+        school_list = [s.strip() for s in schools.split(",")]
+
+        if len(school_list) < 2:
+            raise HTTPException(status_code=400, detail="Must provide at least 2 schools")
+        if len(school_list) > 4:
+            raise HTTPException(status_code=400, detail="Maximum 4 schools allowed")
+
+        # Get rankings for all schools
+        all_rankings_response = await get_team_rankings_endpoint(
+            request=request,
+            conference=None,
+            tier=None,
+            sort_by="power_score",
+            limit=200,
+            api_key=api_key,
+        )
+
+        all_rankings = all_rankings_response.data["rankings"]
+
+        # Find requested schools
+        comparisons = []
+        for school_name in school_list:
+            school_data = next(
+                (r for r in all_rankings if r["school"].lower() == school_name.lower()),
+                None
+            )
+            if school_data:
+                comparisons.append(school_data)
+
+        if len(comparisons) < 2:
+            raise HTTPException(status_code=404, detail="Could not find enough schools to compare")
+
+        return APIResponse(
+            status="success",
+            data={
+                "schools": comparisons,
+                "count": len(comparisons),
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Team comparison error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
