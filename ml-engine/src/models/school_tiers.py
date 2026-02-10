@@ -18,6 +18,11 @@ from pathlib import Path
 
 import pandas as pd
 
+# Import R2 storage for loading data
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.s3_storage import load_csv_with_fallback
+
 logger = logging.getLogger(__name__)
 
 # Tier definitions with multiplier ranges
@@ -59,27 +64,16 @@ MANUAL_OVERRIDES = {
 
 
 def load_team_data() -> Optional[pd.DataFrame]:
-    """Load and merge CFBD team data from separate CSV files."""
+    """Load and merge CFBD team data from R2 storage."""
     try:
-        # Determine data directory
-        data_dir = Path(__file__).parent.parent.parent / "data" / "processed"
+        # Load team records from R2 (wins, losses, conference)
+        records_df = load_csv_with_fallback("cfbd_team_records.csv", subfolder="processed")
 
-        if not data_dir.exists():
-            logger.warning(f"Data directory not found: {data_dir}")
+        if records_df is None or records_df.empty:
+            logger.warning("Team records file not found in R2")
             return None
 
-        # Load the three CFBD files
-        records_file = data_dir / "cfbd_team_records.csv"
-        sp_file = data_dir / "cfbd_sp_ratings.csv"
-        talent_file = data_dir / "cfbd_team_talent.csv"
-
-        # Load team records (wins, losses, conference)
-        if not records_file.exists():
-            logger.warning(f"Team records file not found: {records_file}")
-            return None
-
-        records_df = pd.read_csv(records_file)
-        logger.info(f"Loaded {len(records_df)} team records")
+        logger.info(f"Loaded {len(records_df)} team records from R2")
 
         # Filter to latest season and FBS only (skip FCS/D2/D3)
         if "year" in records_df.columns:
@@ -103,10 +97,11 @@ def load_team_data() -> Optional[pd.DataFrame]:
             "school": "team",
         })
 
-        # Load SP+ ratings
+        # Load SP+ ratings from R2
         team_df = records_df.copy()
-        if sp_file.exists():
-            sp_df = pd.read_csv(sp_file)
+        sp_df = load_csv_with_fallback("cfbd_sp_ratings.csv", subfolder="processed")
+
+        if sp_df is not None and not sp_df.empty:
             if "year" in sp_df.columns:
                 latest_sp_year = sp_df["year"].max()
                 sp_df = sp_df[sp_df["year"] == latest_sp_year]
@@ -121,9 +116,10 @@ def load_team_data() -> Optional[pd.DataFrame]:
             )
             logger.info(f"Merged SP+ data: {sp_df['sp_overall'].notna().sum()} teams")
 
-        # Load talent composite
-        if talent_file.exists():
-            talent_df = pd.read_csv(talent_file)
+        # Load talent composite from R2
+        talent_df = load_csv_with_fallback("cfbd_team_talent.csv", subfolder="processed")
+
+        if talent_df is not None and not talent_df.empty:
             if "year" in talent_df.columns:
                 talent_df = talent_df[talent_df["year"] == 2024]
 
@@ -131,10 +127,10 @@ def load_team_data() -> Optional[pd.DataFrame]:
             # This is a known data issue - talent composite will be NaN for now
             logger.warning("Talent composite file exists but missing school names - skipping merge")
 
-        # Load On3 team portal rankings (portal performance + NIL changes)
-        portal_rankings_file = data_dir / "on3_team_portal_rankings.csv"
-        if portal_rankings_file.exists():
-            portal_df = pd.read_csv(portal_rankings_file)
+        # Load On3 team portal rankings from R2
+        portal_df = load_csv_with_fallback("on3_team_portal_rankings.csv", subfolder="processed")
+
+        if portal_df is not None and not portal_df.empty:
 
             # Filter to latest year (2026 cycle)
             if "year" in portal_df.columns:
