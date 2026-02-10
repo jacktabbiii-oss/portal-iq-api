@@ -2250,6 +2250,339 @@ async def school_tier_detail(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get(
+    "/teams/rankings",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Get comprehensive team rankings",
+    description="Get team rankings across multiple metrics: talent, SP+, wins, portal activity, PFF grades. Filterable and sortable.",
+)
+async def team_rankings(
+    request: Request,
+    conference: Optional[str] = None,
+    tier: Optional[str] = None,
+    sort_by: str = "power_score",
+    limit: int = 130,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Get comprehensive team rankings with CFBD/ESPN/On3 data.
+
+    Metrics included:
+    - School tier (CFBD-based dynamic)
+    - Team talent composite
+    - SP+ ratings (overall, offense, defense)
+    - Win-loss record
+    - Portal activity (net gains/losses)
+    - PFF team averages
+    - Combined power score
+
+    Args:
+        conference: Filter by conference (e.g., "SEC", "Big Ten")
+        tier: Filter by tier (e.g., "blue_blood", "elite")
+        sort_by: Metric to sort by (power_score, talent, sp_plus, wins, portal_net)
+        limit: Max teams to return
+    """
+    try:
+        from ..models.school_tiers import get_school_tiers, TIER_DEFINITIONS
+        from ..utils.unified_cache import get_unified_cache
+
+        # Get all school tiers (includes wins, SP+, talent from CFBD)
+        tiers_data = get_school_tiers()
+
+        # Load unified cache for PFF and portal data
+        cache = get_unified_cache()
+
+        rankings = []
+
+        for school, tier_info in tiers_data.items():
+            # Apply filters
+            if conference and tier_info.get("conference", "").lower() != conference.lower():
+                continue
+            if tier and tier_info.get("tier", "") != tier:
+                continue
+
+            # Base data from CFBD
+            school_data = {
+                "school": school,
+                "tier": tier_info.get("tier", "power_mid"),
+                "tier_multiplier": tier_info.get("multiplier", 1.0),
+                "tier_label": tier_info.get("label", "Unknown"),
+                "score": tier_info.get("score", 0),
+                "wins": tier_info.get("wins", 0),
+                "losses": tier_info.get("losses", 0),
+                "conference": tier_info.get("conference", "Unknown"),
+                "sp_plus_overall": tier_info.get("sp_plus_overall", 0),
+                "sp_plus_offense": tier_info.get("sp_plus_offense", 0),
+                "sp_plus_defense": tier_info.get("sp_plus_defense", 0),
+                "talent_composite": tier_info.get("talent_composite", 0),
+            }
+
+            # Portal performance (On3 data with NIL changes)
+            school_data["portal_rank"] = tier_info.get("portal_rank")
+            school_data["portal_score"] = tier_info.get("portal_score")
+            school_data["transfers_in"] = tier_info.get("transfers_in", 0)
+            school_data["transfers_out"] = tier_info.get("transfers_out", 0)
+            school_data["portal_net"] = tier_info.get("portal_net", 0)
+            school_data["avg_rating_in"] = tier_info.get("avg_rating_in")
+            school_data["avg_rating_out"] = tier_info.get("avg_rating_out")
+            school_data["five_stars_net"] = tier_info.get("five_stars_net", 0)
+            school_data["four_stars_net"] = tier_info.get("four_stars_net", 0)
+            school_data["three_stars_net"] = tier_info.get("three_stars_net", 0)
+            # NIL spending from On3
+            school_data["nil_valuation"] = tier_info.get("nil_valuation")
+            school_data["nil_valuation_change"] = tier_info.get("nil_valuation_change")
+
+            # Calculate roster-based metrics (PFF + NIL talent)
+            try:
+                roster_df = cache.get_players_by_school(school)
+                if not roster_df.empty:
+                    roster_size = len(roster_df)
+
+                    # PFF team average
+                    if "pff_overall" in roster_df.columns:
+                        pff_grades = roster_df["pff_overall"].dropna()
+                        avg_pff = float(pff_grades.mean()) if not pff_grades.empty else 0
+                    else:
+                        avg_pff = 0
+
+                    # Roster talent score (based on player NIL valuations)
+                    if "nil_value" in roster_df.columns:
+                        nil_values = roster_df["nil_value"].dropna()
+                        if not nil_values.empty:
+                            # Talent score: avg NIL normalized to 0-1000 scale
+                            avg_nil = float(nil_values.mean())
+                            # Also weight by top players (elite talent matters)
+                            top_10_nil = float(nil_values.nlargest(10).mean())
+                            # Combined: 60% avg + 40% top-10
+                            roster_talent = (avg_nil * 0.6 + top_10_nil * 0.4) / 100
+                        else:
+                            roster_talent = 0
+                    else:
+                        roster_talent = 0
+
+                    school_data["pff_avg"] = round(avg_pff, 1)
+                    school_data["roster_size"] = roster_size
+                    school_data["roster_talent"] = round(roster_talent, 1)
+                else:
+                    avg_pff, roster_size, roster_talent = 0, 0, 0
+                    school_data["pff_avg"] = 0
+                    school_data["roster_size"] = 0
+                    school_data["roster_talent"] = 0
+            except Exception:
+                school_data["pff_avg"] = 0
+                school_data["roster_size"] = 0
+                school_data["roster_talent"] = 0
+
+            # Calculate combined power score - Portal IQ Proprietary Algorithm
+            # Our comprehensive ranking combining:
+            # - On-field performance (SP+, wins): 30%
+            # - Roster quality (PFF, talent): 25%
+            # - Portal performance (On3, transfers): 25%
+            # - NIL/recruiting power (tier, spending): 20%
+            power_score = 0
+
+            # On-field performance (30%)
+            if school_data["sp_plus_overall"] > -15:
+                power_score += ((school_data["sp_plus_overall"] + 15) / 45) * 18  # 18%
+            power_score += (school_data["wins"] / 15) * 12  # 12%
+
+            # Roster quality (25%) - Based on actual player performance/value
+            if school_data["pff_avg"] > 0:
+                power_score += (school_data["pff_avg"] / 90) * 15  # 15% - PFF grades
+            if school_data["roster_talent"] > 0:
+                power_score += (school_data["roster_talent"] / 1000) * 10  # 10% - NIL-based talent
+
+            # Portal performance (25%) - On3 rankings + transfer quality
+            if school_data["portal_rank"]:
+                # Lower rank is better: rank 1 = 15 pts, rank 50 = 0 pts
+                portal_score = max(0, (51 - school_data["portal_rank"]) / 51 * 15)
+                power_score += portal_score  # 15%
+
+            # Transfer quality delta (avg rating in vs out)
+            if school_data["avg_rating_in"] and school_data["avg_rating_out"]:
+                rating_diff = school_data["avg_rating_in"] - school_data["avg_rating_out"]
+                # +10 rating diff = 5 pts
+                power_score += min(5, max(0, (rating_diff / 10) * 5))  # 5%
+
+            # Star recruits net gained (weighted by star level)
+            stars_gained = (school_data["five_stars_net"] * 3 +
+                          school_data["four_stars_net"] * 1.5 +
+                          school_data["three_stars_net"] * 0.5)
+            power_score += min(5, max(0, stars_gained / 2))  # 5%
+
+            # NIL/recruiting power (20%)
+            power_score += (school_data["tier_multiplier"] / 3.0) * 10  # 10%
+
+            # NIL spending (portal investment)
+            if school_data["nil_valuation_change"] and school_data["nil_valuation_change"] > 0:
+                # $5M spend = 10 pts
+                nil_score = min(10, (school_data["nil_valuation_change"] / 5000000) * 10)
+                power_score += nil_score  # 10%
+
+            school_data["power_score"] = round(power_score, 1)
+
+            rankings.append(school_data)
+
+        # Sort by requested metric
+        sort_keys = {
+            "power_score": lambda x: x["power_score"],
+            "talent": lambda x: x["talent_composite"],
+            "sp_plus": lambda x: x["sp_plus_overall"],
+            "wins": lambda x: x["wins"],
+            "portal_net": lambda x: x["portal_net"],
+            "portal_rank": lambda x: x["portal_rank"] if x["portal_rank"] else 999,  # Lower rank = better
+            "nil_change": lambda x: x["nil_valuation_change"] if x["nil_valuation_change"] else 0,
+            "pff_avg": lambda x: x["pff_avg"],
+            "tier": lambda x: x["tier_multiplier"],
+        }
+
+        sort_key = sort_keys.get(sort_by, sort_keys["power_score"])
+        # Portal rank sorts ascending (lower is better), others descending
+        reverse_sort = True if sort_by != "portal_rank" else False
+        rankings.sort(key=sort_key, reverse=reverse_sort)
+
+        # Apply limit
+        rankings = rankings[:limit]
+
+        # Add rank numbers
+        for i, team in enumerate(rankings):
+            team["rank"] = i + 1
+
+        return APIResponse(
+            status="success",
+            data={
+                "teams": rankings,
+                "total": len(rankings),
+                "sort_by": sort_by,
+                "filters": {
+                    "conference": conference,
+                    "tier": tier,
+                },
+            },
+            message=f"Team rankings sorted by {sort_by}"
+        )
+
+    except Exception as e:
+        logger.error(f"Team rankings error: {e}")
+        return APIResponse(
+            status="error",
+            data=[],
+            message=f"Could not load team rankings: {str(e)}"
+        )
+
+
+@router.get(
+    "/teams/compare",
+    response_model=APIResponse,
+    tags=["Teams"],
+    summary="Compare teams side-by-side",
+    description="Compare multiple teams across all metrics: talent, SP+, wins, portal, PFF, roster composition.",
+)
+async def compare_teams(
+    request: Request,
+    schools: str,  # Comma-separated list like "Alabama,Georgia,Texas"
+    api_key: str = Depends(require_api_key),
+):
+    """
+    Compare teams side-by-side with comprehensive metrics.
+
+    Args:
+        schools: Comma-separated school names (e.g., "Alabama,Georgia,Ohio State")
+
+    Returns:
+        Detailed comparison across all metrics
+    """
+    try:
+        from ..models.school_tiers import get_school_tier
+        from ..utils.unified_cache import get_unified_cache
+
+        school_list = [s.strip() for s in schools.split(",")]
+        cache = get_unified_cache()
+
+        comparisons = []
+
+        for school in school_list:
+            try:
+                # Get tier data
+                tier_name, tier_info = get_school_tier(school)
+
+                # Get roster
+                roster_df = cache.get_players_by_school(school)
+
+                # Position breakdown
+                position_counts = {}
+                if not roster_df.empty and "position" in roster_df.columns:
+                    position_counts = roster_df["position"].value_counts().to_dict()
+
+                # PFF breakdown
+                pff_stats = {}
+                if not roster_df.empty:
+                    for stat in ["pff_overall", "pff_offense", "pff_defense"]:
+                        if stat in roster_df.columns:
+                            pff_stats[stat] = round(float(roster_df[stat].mean()), 1)
+
+                # Portal activity
+                portal_out = 0
+                if not roster_df.empty and "in_portal" in roster_df.columns:
+                    portal_out = int(roster_df["in_portal"].sum())
+
+                # NIL total
+                nil_total = 0
+                nil_avg = 0
+                if not roster_df.empty and "nil_value" in roster_df.columns:
+                    nil_values = roster_df["nil_value"].dropna()
+                    if not nil_values.empty:
+                        nil_total = int(nil_values.sum())
+                        nil_avg = int(nil_values.mean())
+
+                comparison = {
+                    "school": school,
+                    "tier": tier_name,
+                    "tier_multiplier": tier_info.get("multiplier", 1.0),
+                    "tier_label": tier_info.get("label", "Unknown"),
+                    "wins": tier_info.get("wins", 0),
+                    "losses": tier_info.get("losses", 0),
+                    "conference": tier_info.get("conference", "Unknown"),
+                    "sp_plus_overall": tier_info.get("sp_plus_overall", 0),
+                    "sp_plus_offense": tier_info.get("sp_plus_offense", 0),
+                    "sp_plus_defense": tier_info.get("sp_plus_defense", 0),
+                    "talent_composite": tier_info.get("talent_composite", 0),
+                    "roster_size": len(roster_df),
+                    "position_breakdown": position_counts,
+                    "pff_grades": pff_stats,
+                    "portal_outgoing": portal_out,
+                    "nil_total": nil_total,
+                    "nil_avg": nil_avg,
+                }
+
+                comparisons.append(comparison)
+
+            except Exception as e:
+                logger.warning(f"Could not load data for {school}: {e}")
+                comparisons.append({
+                    "school": school,
+                    "error": f"Data not available: {str(e)}"
+                })
+
+        return APIResponse(
+            status="success",
+            data={
+                "schools": school_list,
+                "comparisons": comparisons,
+            },
+            message=f"Comparison of {len(school_list)} teams"
+        )
+
+    except Exception as e:
+        logger.error(f"Team comparison error: {e}")
+        return APIResponse(
+            status="error",
+            data=[],
+            message=f"Could not compare teams: {str(e)}"
+        )
+
+
 # =============================================================================
 # Draft Endpoints
 # =============================================================================
