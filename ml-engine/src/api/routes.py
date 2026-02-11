@@ -3759,7 +3759,7 @@ async def get_player_stats(
                 "attempts": int(player_row.get("rushing_attempts")) if pd.notna(player_row.get("rushing_attempts")) else None,
             }
 
-        if position in ("WR", "TE", "RB") and pff_stats:
+        if position in ("WR", "TE", "RB", "HB", "FB") and pff_stats:
             stats["receiving"] = {
                 "yards_per_route_run": pff_stats.get("yards_per_route_run"),
                 "drop_rate": pff_stats.get("drop_rate"),
@@ -3769,6 +3769,15 @@ async def get_player_stats(
                 "receptions": pff_stats.get("receptions"),
                 "yards": pff_stats.get("rec_yards"),
                 "touchdowns": pff_stats.get("touchdowns"),
+            }
+
+        # WRs, TEs, and RBs also get blocking stats (like how defensive players get all defensive categories)
+        if position in ("WR", "TE", "RB", "HB", "FB"):
+            stats["blocking"] = {
+                "pass_block_grade": player_row.get("grades_pass_block") if pd.notna(player_row.get("grades_pass_block")) else None,
+                "run_block_grade": player_row.get("grades_run_block") if pd.notna(player_row.get("grades_run_block")) else None,
+                "pass_blocking_snaps": int(player_row.get("pass_blocking_snaps")) if pd.notna(player_row.get("pass_blocking_snaps")) else None,
+                "run_blocking_snaps": int(player_row.get("run_blocking_snaps")) if pd.notna(player_row.get("run_blocking_snaps")) else None,
             }
 
         # All defensive positions get all defensive stat categories
