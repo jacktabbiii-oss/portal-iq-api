@@ -3689,13 +3689,24 @@ async def get_player_stats(
             if pd.notna(player_row.get("pff_rushing")):
                 pff_grades["rushing"] = float(player_row.get("pff_rushing"))
 
-        elif position in ("RB", "HB"):
+        elif position in ("RB", "HB", "FB"):
             pff_grades["rushing"] = float(player_row.get("pff_rushing")) if pd.notna(player_row.get("pff_rushing")) else None
             if pd.notna(player_row.get("pff_receiving")):
                 pff_grades["receiving"] = float(player_row.get("pff_receiving"))
+            # RBs also block
+            if pd.notna(player_row.get("grades_pass_block")):
+                pff_grades["pass_block"] = float(player_row.get("grades_pass_block"))
+            if pd.notna(player_row.get("grades_run_block")):
+                pff_grades["run_block"] = float(player_row.get("grades_run_block"))
 
-        elif position in ("WR", "TE"):
+        elif position == "WR":
             pff_grades["receiving"] = float(player_row.get("pff_receiving")) if pd.notna(player_row.get("pff_receiving")) else None
+
+        elif position == "TE":
+            pff_grades["receiving"] = float(player_row.get("pff_receiving")) if pd.notna(player_row.get("pff_receiving")) else None
+            # TEs also block
+            pff_grades["pass_block"] = float(player_row.get("grades_pass_block")) if pd.notna(player_row.get("grades_pass_block")) else None
+            pff_grades["run_block"] = float(player_row.get("grades_run_block")) if pd.notna(player_row.get("grades_run_block")) else None
 
         elif position in ("OL", "OT", "OG", "C", "IOL"):
             pff_grades["pass_block"] = float(player_row.get("grades_pass_block")) if pd.notna(player_row.get("grades_pass_block")) else None
@@ -3709,6 +3720,9 @@ async def get_player_stats(
             pff_grades["run_defense"] = float(player_row.get("pff_run_defense")) if pd.notna(player_row.get("pff_run_defense")) else None
             pff_grades["coverage"] = float(player_row.get("pff_coverage")) if pd.notna(player_row.get("pff_coverage")) else None
             pff_grades["tackling"] = float(player_row.get("pff_tackling")) if pd.notna(player_row.get("pff_tackling")) else None
+            # LBs can also blitz
+            if pd.notna(player_row.get("pff_pass_rush")):
+                pff_grades["pass_rush"] = float(player_row.get("pff_pass_rush"))
 
         elif position in ("CB", "S"):
             pff_grades["coverage"] = float(player_row.get("pff_coverage")) if pd.notna(player_row.get("pff_coverage")) else None
