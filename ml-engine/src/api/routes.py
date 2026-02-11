@@ -3670,64 +3670,79 @@ async def get_player_stats(
             "weight": float(player_row.get("weight", 0)) if pd.notna(player_row.get("weight")) else None,
         }
 
-        # Use PFF stats if available, otherwise try from player_row
-        if pff_stats:
-            stats["pff"] = {
-                "overall": pff_stats.get("pff_overall"),
-                "offense": pff_stats.get("pff_offense"),
-                "defense": pff_stats.get("pff_defense"),
-                "passing": pff_stats.get("pff_passing"),
-                "rushing": pff_stats.get("pff_rushing"),
-                "receiving": pff_stats.get("pff_receiving"),
-                "pass_block": pff_stats.get("pff_pass_block"),
-                "run_block": pff_stats.get("pff_run_block"),
-                "pass_rush": pff_stats.get("pff_pass_rush"),
-                "run_defense": pff_stats.get("pff_run_defense"),
-                "tackling": pff_stats.get("pff_tackling"),
-                "coverage": pff_stats.get("pff_coverage"),
-            }
-        else:
-            stats["pff"] = {
-                "overall": float(player_row.get("pff_overall", 0)) if pd.notna(player_row.get("pff_overall")) else None,
-                "offense": float(player_row.get("pff_offense", 0)) if pd.notna(player_row.get("pff_offense")) else None,
-                "defense": float(player_row.get("pff_defense", 0)) if pd.notna(player_row.get("pff_defense")) else None,
-                "passing": None,
-                "rushing": None,
-                "receiving": None,
-                "pass_block": None,
-                "run_block": None,
-                "pass_rush": None,
-                "run_defense": None,
-                "tackling": None,
-                "coverage": None,
-            }
-
-        # Add position-specific stats from PFF data
+        # Build PFF grades dict with position-relevant grades only
         position = str(player_row.get("position", "")).upper()
+        pff_grades = {
+            "overall": float(player_row.get("pff_overall")) if pd.notna(player_row.get("pff_overall")) else None,
+        }
 
-        if position == "QB" and pff_stats:
+        # Add offense/defense based on position
+        if position in ("QB", "RB", "HB", "WR", "TE", "OL", "OT", "OG", "C", "IOL"):
+            pff_grades["offense"] = float(player_row.get("pff_offense")) if pd.notna(player_row.get("pff_offense")) else None
+
+        if position in ("EDGE", "DL", "DT", "DE", "LB", "CB", "S"):
+            pff_grades["defense"] = float(player_row.get("pff_defense")) if pd.notna(player_row.get("pff_defense")) else None
+
+        # Add position-specific grades
+        if position == "QB":
+            pff_grades["passing"] = float(player_row.get("pff_passing")) if pd.notna(player_row.get("pff_passing")) else None
+            if pd.notna(player_row.get("pff_rushing")):
+                pff_grades["rushing"] = float(player_row.get("pff_rushing"))
+
+        elif position in ("RB", "HB"):
+            pff_grades["rushing"] = float(player_row.get("pff_rushing")) if pd.notna(player_row.get("pff_rushing")) else None
+            if pd.notna(player_row.get("pff_receiving")):
+                pff_grades["receiving"] = float(player_row.get("pff_receiving"))
+
+        elif position in ("WR", "TE"):
+            pff_grades["receiving"] = float(player_row.get("pff_receiving")) if pd.notna(player_row.get("pff_receiving")) else None
+
+        elif position in ("OL", "OT", "OG", "C", "IOL"):
+            pff_grades["pass_block"] = float(player_row.get("grades_pass_block")) if pd.notna(player_row.get("grades_pass_block")) else None
+            pff_grades["run_block"] = float(player_row.get("grades_run_block")) if pd.notna(player_row.get("grades_run_block")) else None
+
+        elif position in ("EDGE", "DL", "DT", "DE"):
+            pff_grades["pass_rush"] = float(player_row.get("pff_pass_rush")) if pd.notna(player_row.get("pff_pass_rush")) else None
+            pff_grades["run_defense"] = float(player_row.get("pff_run_defense")) if pd.notna(player_row.get("pff_run_defense")) else None
+
+        elif position in ("LB",):
+            pff_grades["run_defense"] = float(player_row.get("pff_run_defense")) if pd.notna(player_row.get("pff_run_defense")) else None
+            pff_grades["coverage"] = float(player_row.get("pff_coverage")) if pd.notna(player_row.get("pff_coverage")) else None
+            pff_grades["tackling"] = float(player_row.get("pff_tackling")) if pd.notna(player_row.get("pff_tackling")) else None
+
+        elif position in ("CB", "S"):
+            pff_grades["coverage"] = float(player_row.get("pff_coverage")) if pd.notna(player_row.get("pff_coverage")) else None
+            pff_grades["tackling"] = float(player_row.get("pff_tackling")) if pd.notna(player_row.get("pff_tackling")) else None
+
+        stats["pff"] = pff_grades
+
+        # Add position-specific stats from player data
+
+        if position == "QB":
             stats["passing"] = {
-                "passer_rating": pff_stats.get("passer_rating"),
-                "completion_pct": pff_stats.get("completion_pct"),
-                "big_time_throws": pff_stats.get("big_time_throws"),
-                "big_time_throw_pct": pff_stats.get("big_time_throw_pct"),
-                "turnover_worthy_plays": pff_stats.get("turnover_worthy_plays"),
-                "pressure_completion_pct": pff_stats.get("pressure_completion_pct"),
-                "pressure_qb_rating": pff_stats.get("pressure_qb_rating"),
-                "yards": pff_stats.get("yards"),
-                "touchdowns": pff_stats.get("touchdowns"),
+                "passer_rating": player_row.get("passer_rating") if pd.notna(player_row.get("passer_rating")) else None,
+                "completion_pct": player_row.get("completion_pct") if pd.notna(player_row.get("completion_pct")) else None,
+                "big_time_throws": player_row.get("big_time_throws") if pd.notna(player_row.get("big_time_throws")) else None,
+                "big_time_throw_pct": player_row.get("big_time_throw_pct") if pd.notna(player_row.get("big_time_throw_pct")) else None,
+                "turnover_worthy_plays": player_row.get("turnover_worthy_plays") if pd.notna(player_row.get("turnover_worthy_plays")) else None,
+                "pressure_completion_pct": player_row.get("pressure_completion_pct") if pd.notna(player_row.get("pressure_completion_pct")) else None,
+                "pressure_qb_rating": player_row.get("pressure_qb_rating") if pd.notna(player_row.get("pressure_qb_rating")) else None,
+                "yards": int(player_row.get("passing_yards")) if pd.notna(player_row.get("passing_yards")) else None,
+                "touchdowns": int(player_row.get("passing_tds")) if pd.notna(player_row.get("passing_tds")) else None,
+                "attempts": int(player_row.get("attempts")) if pd.notna(player_row.get("attempts")) else None,
+                "completions": int(player_row.get("completions")) if pd.notna(player_row.get("completions")) else None,
             }
 
-        if position in ("RB", "QB") and pff_stats:
+        if position in ("RB", "QB", "HB"):
             stats["rushing"] = {
-                "elusive_rating": pff_stats.get("elusive_rating"),
-                "yards_after_contact": pff_stats.get("yards_after_contact"),
-                "yaco_per_attempt": pff_stats.get("yaco_per_attempt"),
-                "breakaway_pct": pff_stats.get("breakaway_pct"),
-                "missed_tackles_forced": pff_stats.get("missed_tackles_forced"),
-                "yards": pff_stats.get("yards"),
-                "touchdowns": pff_stats.get("touchdowns"),
-                "yards_per_carry": pff_stats.get("yards_per_carry"),
+                "elusive_rating": player_row.get("elusive_rating") if pd.notna(player_row.get("elusive_rating")) else None,
+                "yards_after_contact": player_row.get("yards_after_contact") if pd.notna(player_row.get("yards_after_contact")) else None,
+                "yaco_per_attempt": player_row.get("yaco_per_attempt") if pd.notna(player_row.get("yaco_per_attempt")) else None,
+                "breakaway_pct": player_row.get("breakaway_percent") if pd.notna(player_row.get("breakaway_percent")) else None,
+                "missed_tackles_forced": int(player_row.get("missed_tackles_forced")) if pd.notna(player_row.get("missed_tackles_forced")) else None,
+                "yards": int(player_row.get("rushing_yards")) if pd.notna(player_row.get("rushing_yards")) else None,
+                "touchdowns": int(player_row.get("rushing_tds")) if pd.notna(player_row.get("rushing_tds")) else None,
+                "attempts": int(player_row.get("rushing_attempts")) if pd.notna(player_row.get("rushing_attempts")) else None,
             }
 
         if position in ("WR", "TE", "RB") and pff_stats:
