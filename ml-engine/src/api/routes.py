@@ -2919,7 +2919,7 @@ async def mock_draft(
 
 
 @router.get(
-    "/draft/project/{player_name}",
+    "/v1/draft/project/{player_name}",
     response_model=APIResponse,
     tags=["Draft"],
     summary="Project draft position for player",
@@ -2967,7 +2967,7 @@ async def draft_project_by_name(
 
 
 @router.get(
-    "/draft/comparables/{player_name}",
+    "/v1/draft/comparables/{player_name}",
     response_model=APIResponse,
     tags=["Draft"],
     summary="Get draft comparables",
@@ -3613,7 +3613,7 @@ async def ai_search_status(
 
 
 @router.get(
-    "/players/{player_name}/stats",
+    "/v1/players/{player_name}/stats",
     response_model=APIResponse,
     tags=["Players"],
     summary="Get player stats",
@@ -4004,7 +4004,7 @@ async def get_player_profile(player_name: str):
 # =============================================================================
 
 @router.get(
-    "/players/{player_name}/comparisons",
+    "/v1/players/{player_name}/comparisons",
     response_model=APIResponse,
     tags=["Players"],
     summary="Get player comparisons",
@@ -4061,7 +4061,7 @@ async def get_player_comparisons_endpoint(
 
 
 @router.get(
-    "/players/{player_name}/career",
+    "/v1/players/{player_name}/career",
     response_model=APIResponse,
     tags=["Players"],
     summary="Get player career stats",
@@ -4102,7 +4102,7 @@ async def get_player_career_endpoint(
 
 
 @router.get(
-    "/players/{player_name}/elite-profile",
+    "/v1/players/{player_name}/elite-profile",
     response_model=APIResponse,
     tags=["Players"],
     summary="Get elite athlete profile",
