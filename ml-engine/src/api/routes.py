@@ -3771,24 +3771,41 @@ async def get_player_stats(
                 "touchdowns": pff_stats.get("touchdowns"),
             }
 
-        if position in ("EDGE", "DT", "DL", "DE") and pff_stats:
+        # All defensive positions get all defensive stat categories
+        if position in ("EDGE", "DT", "DL", "DE", "LB", "CB", "S"):
+            # Pass rush stats (primary for Edge/DL, secondary for LB/CB/S)
             stats["pass_rush"] = {
-                "pass_rushing_productivity": pff_stats.get("pass_rushing_productivity"),
-                "pass_rush_win_rate": pff_stats.get("pass_rush_win_rate"),
-                "pressures": pff_stats.get("pressures"),
-                "sacks": pff_stats.get("sacks"),
-                "hurries": pff_stats.get("hurries"),
-                "hits": pff_stats.get("hits"),
+                "pass_rushing_productivity": player_row.get("pass_rushing_productivity") if pd.notna(player_row.get("pass_rushing_productivity")) else None,
+                "pass_rush_win_rate": player_row.get("pass_rush_win_rate") if pd.notna(player_row.get("pass_rush_win_rate")) else None,
+                "pressures": int(player_row.get("pressures")) if pd.notna(player_row.get("pressures")) else None,
+                "sacks": int(player_row.get("sacks")) if pd.notna(player_row.get("sacks")) else None,
+                "hurries": int(player_row.get("hurries")) if pd.notna(player_row.get("hurries")) else None,
+                "hits": int(player_row.get("hits")) if pd.notna(player_row.get("hits")) else None,
             }
 
-        if position in ("CB", "S", "LB") and pff_stats:
+            # Coverage stats (primary for CB/S, secondary for LB)
             stats["coverage"] = {
-                "passer_rating_allowed": pff_stats.get("passer_rating_allowed"),
-                "yards_per_coverage_snap": pff_stats.get("yards_per_coverage_snap"),
-                "forced_incompletes": pff_stats.get("forced_incompletes"),
-                "interceptions": pff_stats.get("interceptions"),
-                "pass_breakups": pff_stats.get("pass_breakups"),
-                "missed_tackle_rate": pff_stats.get("missed_tackle_rate"),
+                "passer_rating_allowed": player_row.get("qb_rating_against") if pd.notna(player_row.get("qb_rating_against")) else None,
+                "yards_per_coverage_snap": player_row.get("yards_per_coverage_snap") if pd.notna(player_row.get("yards_per_coverage_snap")) else None,
+                "forced_incompletes": player_row.get("forced_incompletes") if pd.notna(player_row.get("forced_incompletes")) else None,
+                "interceptions": int(player_row.get("interceptions")) if pd.notna(player_row.get("interceptions")) else None,
+                "pass_breakups": int(player_row.get("pass_break_ups")) if pd.notna(player_row.get("pass_break_ups")) else None,
+                "targets_allowed": int(player_row.get("targets_coverage")) if pd.notna(player_row.get("targets_coverage")) else None,
+                "receptions_allowed": int(player_row.get("receptions_coverage")) if pd.notna(player_row.get("receptions_coverage")) else None,
+            }
+
+            # Tackling stats (all defensive players)
+            stats["tackling"] = {
+                "tackles": int(player_row.get("tackles")) if pd.notna(player_row.get("tackles")) else None,
+                "assists": int(player_row.get("assists")) if pd.notna(player_row.get("assists")) else None,
+                "missed_tackle_rate": player_row.get("missed_tackle_rate") if pd.notna(player_row.get("missed_tackle_rate")) else None,
+                "missed_tackles": int(player_row.get("missed_tackles")) if pd.notna(player_row.get("missed_tackles")) else None,
+            }
+
+            # Run defense stats (all defensive players)
+            stats["run_defense"] = {
+                "run_stops": int(player_row.get("run_stops")) if pd.notna(player_row.get("run_stops")) else None,
+                "run_stop_pct": player_row.get("run_stop_pct") if pd.notna(player_row.get("run_stop_pct")) else None,
             }
 
         if position in ("OT", "OG", "C", "OL", "IOL") and pff_stats:
