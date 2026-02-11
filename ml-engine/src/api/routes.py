@@ -3828,7 +3828,7 @@ async def get_player_stats(
 # =============================================================================
 
 @router.get(
-    "/players/{player_name}/profile",
+    "/v1/players/{player_name}/profile",
     response_model=APIResponse,
     tags=["Players"],
     summary="Get comprehensive player profile",
@@ -3857,6 +3857,8 @@ async def get_player_profile(player_name: str):
             "stars": int(player.get("stars")) if pd.notna(player.get("stars")) else None,
             "class_year": str(player.get("class_year", "")) if pd.notna(player.get("class_year")) else None,
             "conference": str(player.get("conference", "")) if pd.notna(player.get("conference")) else None,
+            "division": str(player.get("division", "")) if pd.notna(player.get("division")) else None,
+            "jersey": str(player.get("jersey", "")) if pd.notna(player.get("jersey")) else None,
         }
 
         # NIL
@@ -3873,24 +3875,63 @@ async def get_player_profile(player_name: str):
             profile["confidence"] = None
             profile["valuation_source"] = None
 
-        # PFF stats (all available columns)
+        # PFF stats (all available columns) - comprehensive
         pff_stats = {}
         pff_columns = [
+            # Core PFF grades
             "pff_overall", "pff_offense", "pff_defense",
             "pff_passing", "pff_rushing", "pff_receiving",
             "pff_pass_block", "pff_run_block", "pff_pass_rush",
             "pff_coverage", "pff_run_defense", "pff_tackling",
-            "games_played", "completion_pct", "passer_rating",
+
+            # Volume
+            "games_played",
+
+            # QB stats
+            "completion_pct", "passer_rating",
             "big_time_throw_pct", "turnover_worthy_play_pct",
+            "avg_depth_of_target",
+
+            # RB stats
             "elusive_rating", "yaco_per_attempt", "breakaway_pct",
+            "breakaway_percent", "breakaway_yards", "missed_tackles_forced",
+
+            # WR/TE stats
             "yards_per_route_run", "drop_rate", "contested_catch_rate",
-            "targeted_qb_rating", "pass_rush_win_rate", "pass_rushing_productivity",
-            "pressures", "sacks", "forced_incompletion_rate",
-            "passer_rating_allowed", "yards_per_coverage_snap",
+            "targeted_qb_rating", "targets", "receptions", "rec_yards",
+
+            # Pass rush stats (Edge/DL)
+            "pass_rush_win_rate", "pass_rushing_productivity",
+            "pressures", "hits", "hurries", "batted_passes", "sacks",
+
+            # Coverage stats (DB)
+            "targets_coverage", "receptions_coverage", "interceptions_coverage",
+            "pass_break_ups", "qb_rating_against",
+            "forced_incompletion_rate", "passer_rating_allowed",
+            "yards_per_coverage_snap",
             "man_grades_coverage_defense", "zone_grades_coverage_defense",
-            "pass_blocking_efficiency", "pressures_allowed",
-            "tackles", "missed_tackle_rate",
-            "targets", "receptions", "rec_yards", "yards", "touchdowns",
+
+            # Blocking stats (OL)
+            "pass_blocking_efficiency", "pressures_allowed", "sacks_allowed",
+            "grades_pass_block", "grades_run_block",
+
+            # Defense stats
+            "tackles", "assists", "interceptions", "missed_tackle_rate",
+
+            # Special teams - Kicking
+            "total_made", "pat_made", "twenty_made", "thirty_made",
+            "forty_made", "fifty_made", "touchbacks",
+
+            # Special teams - Punting
+            "attempts_punt", "average_yards_per_attempt", "average_net_yards",
+            "inside_twenties", "average_hangtime",
+
+            # Special teams - Returns
+            "kickoff_attempts", "kickoff_yards", "kickoff_touchdowns",
+            "punt_attempts", "punt_yards", "punt_touchdowns",
+
+            # Production stats (generic)
+            "yards", "touchdowns",
         ]
         for col in pff_columns:
             val = player.get(col)
@@ -3937,9 +3978,11 @@ async def get_player_profile(player_name: str):
         profile["school_tier"] = str(player.get("school_tier", "")) if pd.notna(player.get("school_tier")) else None
         profile["school_multiplier"] = float(player.get("school_multiplier")) if pd.notna(player.get("school_multiplier")) else None
 
-        # Stats
-        for stat in ["passing_yards", "passing_tds", "rushing_yards", "rushing_tds",
-                     "receiving_yards", "receiving_tds", "tackles", "sacks"]:
+        # Career stats
+        for stat in ["passing_yards", "passing_tds", "passing_ints",
+                     "rushing_yards", "rushing_tds", "rushing_attempts",
+                     "receiving_yards", "receiving_tds",
+                     "tackles", "assists", "sacks", "interceptions"]:
             val = player.get(stat)
             profile[stat] = float(val) if pd.notna(val) else None
 
